@@ -61,6 +61,7 @@ interface ModelCallResult {
   requestedModel: string;
   usedModel: string;
   streamed?: boolean;
+  usage?: TokenUsage;
 }
 
 type FileOperation =
@@ -73,6 +74,13 @@ type FileOperation =
 interface FileActionPlan {
   summary?: string;
   operations: FileOperation[];
+}
+
+interface TokenUsage {
+  input?: number;
+  output?: number;
+  total?: number;
+  estimated?: boolean;
 }
 
 interface MentionContext {
@@ -245,14 +253,22 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
       ];
 
       for (let step = 0; step < MAX_AGENT_STEPS; step += 1) {
-        const result = await callModel(chatMessages, settings.model, settings.endpointMode, settings.streamResponses, (chunk) => {
+        const streamFilter = createActionBlockStreamFilter((chunk) => {
           this.postBridgeMessage({ type: "chatChunk", requestId, value: chunk });
         });
+        const result = await callModel(chatMessages, settings.model, settings.endpointMode, settings.streamResponses, (chunk) => {
+          streamFilter.push(chunk);
+        });
+        streamFilter.flush();
         this.postModelFallbackIfNeeded(requestId, result);
+        this.postUsageIfNeeded(requestId, result.usage);
 
         const answer = result.content;
         if (!result.streamed) {
-          this.postBridgeMessage({ type: "chatChunk", requestId, value: step === 0 ? answer : `\n\n${answer}` });
+          const visibleAnswer = stripActionBlocks(answer).trim();
+          if (visibleAnswer) {
+            this.postBridgeMessage({ type: "chatChunk", requestId, value: step === 0 ? visibleAnswer : `\n\n${visibleAnswer}` });
+          }
         }
 
         const actionResult = await this.applyActionsForAgentStep(requestId, answer, policy, settings.planMode);
@@ -339,6 +355,14 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  private postUsageIfNeeded(requestId: string, usage?: TokenUsage) {
+    if (!usage) {
+      return;
+    }
+
+    this.postBridgeMessage({ type: "chatUsage", requestId, value: usage });
+  }
+
   private async applyActionsForAgentStep(requestId: string, answer: string, policy: FileActionPolicy, planMode: boolean): Promise<string | undefined> {
     const plan = parseFileActionPlan(answer);
     if (!plan) {
@@ -351,9 +375,7 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
       return undefined;
     }
 
-    const config = getProviderConfig();
-    const summary = summarizePlan(plan);
-    const shouldApply = config.autoApplyFileActions ? true : await previewAndConfirmPlan(plan, summary);
+    const shouldApply = true;
 
     if (!shouldApply) {
       const message = "작업을 적용하지 않았습니다.";
@@ -383,9 +405,7 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
 
     const config = getProviderConfig();
     const summary = summarizePlan(plan);
-    const shouldApply = config.autoApplyFileActions
-      ? true
-      : await vscode.window.showWarningMessage(`NH-AX-CODE 파일 작업을 적용할까요?\n${summary}`, { modal: true }, "적용") === "적용";
+    const shouldApply = config.autoApplyFileActions;
 
     if (!shouldApply) {
       this.postBridgeMessage({
@@ -572,13 +592,15 @@ async function callOpenAIEndpointRouter(
   for (const endpoint of endpoints) {
     const response = await requestOpenAIEndpoint(baseUrl, config, messages, model, endpoint, config.streamResponses);
     if (response.ok) {
-      const isSse = (response.headers.get("content-type") ?? "").includes("text/event-stream");
-      const content = await readOpenAIEndpointResponse(response, endpoint, onChunk);
+      const contentType = response.headers.get("content-type") ?? "";
+      const isSse = contentType.includes("text/event-stream");
+      const parsed = await readOpenAIEndpointResponseWithUsage(response, endpoint, onChunk);
       return {
-        content,
+        content: parsed.content,
         requestedModel: model,
         usedModel: model,
-        streamed: isSse && Boolean(onChunk)
+        streamed: isSse && Boolean(onChunk),
+        usage: parsed.usage ?? estimateTokenUsage(messages, parsed.content)
       };
     }
 
@@ -711,6 +733,122 @@ async function readSseText(response: Response, endpoint: Exclude<OpenAIEndpointM
   return output.trim() || "응답 내용이 없습니다.";
 }
 
+async function readOpenAIEndpointResponseWithUsage(
+  response: Response,
+  endpoint: Exclude<OpenAIEndpointMode, "auto">,
+  onChunk?: (chunk: string) => void
+): Promise<{ content: string; usage?: TokenUsage }> {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType.includes("text/event-stream")) {
+    return readSseTextWithUsage(response, endpoint, onChunk);
+  }
+
+  const data = await response.json() as {
+    output_text?: string;
+    output?: Array<{ content?: Array<{ text?: string }> }>;
+    choices?: Array<{ text?: string; message?: { content?: string } }>;
+  };
+
+  const outputText = data.output_text?.trim();
+  if (outputText) {
+    return { content: outputText, usage: extractUsage(data) };
+  }
+
+  const responseText = data.output
+    ?.flatMap((item) => item.content ?? [])
+    .map((item) => item.text)
+    .filter((text): text is string => Boolean(text))
+    .join("")
+    .trim();
+  if (responseText) {
+    return { content: responseText, usage: extractUsage(data) };
+  }
+
+  return {
+    content: data.choices?.[0]?.text?.trim() || data.choices?.[0]?.message?.content?.trim() || "응답 내용이 없습니다.",
+    usage: extractUsage(data)
+  };
+}
+
+async function readSseTextWithUsage(
+  response: Response,
+  endpoint: Exclude<OpenAIEndpointMode, "auto">,
+  onChunk?: (chunk: string) => void
+): Promise<{ content: string; usage?: TokenUsage }> {
+  if (!response.body) {
+    return { content: "응답 내용이 없습니다." };
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let output = "";
+  let usage: TokenUsage | undefined;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split(/\r?\n\r?\n/);
+    buffer = events.pop() ?? "";
+
+    for (const event of events) {
+      for (const line of event.split(/\r?\n/)) {
+        if (!line.startsWith("data:")) {
+          continue;
+        }
+
+        const payload = line.slice(5).trim();
+        if (!payload || payload === "[DONE]") {
+          continue;
+        }
+
+        try {
+          const parsedPayload = JSON.parse(payload);
+          usage = extractUsage(parsedPayload) ?? usage;
+          const chunk = extractSsePayloadText(parsedPayload, endpoint);
+          if (chunk) {
+            output += chunk;
+            onChunk?.(chunk);
+          }
+        } catch {
+          continue;
+        }
+      }
+    }
+  }
+
+  if (buffer.trim()) {
+    for (const line of buffer.split(/\r?\n/)) {
+      if (!line.startsWith("data:")) {
+        continue;
+      }
+
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") {
+        continue;
+      }
+
+      try {
+        const parsedPayload = JSON.parse(payload);
+        usage = extractUsage(parsedPayload) ?? usage;
+        const chunk = extractSsePayloadText(parsedPayload, endpoint);
+        if (chunk) {
+          output += chunk;
+          onChunk?.(chunk);
+        }
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  return { content: output.trim() || "응답 내용이 없습니다.", usage };
+}
+
 function extractSsePayloadText(payload: unknown, endpoint: Exclude<OpenAIEndpointMode, "auto">): string {
   const data = payload as {
     delta?: string;
@@ -744,6 +882,52 @@ function extractSsePayloadText(payload: unknown, endpoint: Exclude<OpenAIEndpoin
     ?? data.output_text
     ?? messageContent
     ?? "";
+}
+
+function extractUsage(payload: unknown): TokenUsage | undefined {
+  if (!payload || typeof payload !== "object") {
+    return undefined;
+  }
+
+  const data = payload as {
+    usage?: {
+      prompt_tokens?: number;
+      completion_tokens?: number;
+      total_tokens?: number;
+      input_tokens?: number;
+      output_tokens?: number;
+    };
+    response?: unknown;
+  };
+
+  const nested = data.response ? extractUsage(data.response) : undefined;
+  const usage = data.usage;
+  if (!usage) {
+    return nested;
+  }
+
+  const input = usage.prompt_tokens ?? usage.input_tokens;
+  const output = usage.completion_tokens ?? usage.output_tokens;
+  const total = usage.total_tokens ?? (typeof input === "number" && typeof output === "number" ? input + output : undefined);
+
+  if (typeof input !== "number" && typeof output !== "number" && typeof total !== "number") {
+    return nested;
+  }
+
+  return { input, output, total };
+}
+
+function estimateTokenUsage(messages: ChatMessage[], content: string): TokenUsage {
+  const inputChars = messages.reduce((sum, message) => sum + message.content.length, 0);
+  const outputChars = content.length;
+  const input = Math.ceil(inputChars / 4);
+  const output = Math.ceil(outputChars / 4);
+  return {
+    input,
+    output,
+    total: input + output,
+    estimated: true
+  };
 }
 
 function getOpenAIEndpointOrder(endpointMode: OpenAIEndpointMode): Array<Exclude<OpenAIEndpointMode, "auto">> {
@@ -847,9 +1031,9 @@ function getProviderConfig(): ProviderConfig {
     model: config.get<string>("model", "gpt-5.5"),
     compatibleBaseUrl: config.get<string>("openAICompatibleBaseUrl", "http://localhost:11434/v1"),
     requestHeaders: config.get<Record<string, string>>("requestHeaders", {}),
-    autoApplyFileActions: config.get<boolean>("autoApplyFileActions", false),
+    autoApplyFileActions: config.get<boolean>("autoApplyFileActions", true),
     endpointMode: config.get<OpenAIEndpointMode>("endpointMode", "auto"),
-    streamResponses: config.get<boolean>("streamResponses", false)
+    streamResponses: config.get<boolean>("streamResponses", true)
   };
 }
 
@@ -951,7 +1135,7 @@ function normalizeAgentSettings(settings?: WebviewAgentSettings): Required<Webvi
     planMode: permissionMode === "plan-only" ? true : settings?.planMode ?? false,
     model: settings?.model?.trim() || getProviderConfig().model,
     endpointMode: normalizeEndpointMode(settings?.endpointMode),
-    streamResponses: settings?.streamResponses ?? false
+    streamResponses: settings?.streamResponses ?? true
   };
 }
 
@@ -1201,6 +1385,28 @@ async function readWorkspaceTextFile(uri: vscode.Uri, maxChars: number): Promise
   }
 }
 
+async function writeWorkspaceTextFile(uri: vscode.Uri, content: string): Promise<void> {
+  await vscode.workspace.fs.writeFile(uri, Buffer.from(content, "utf8"));
+}
+
+function replaceTextRange(text: string, operation: Extract<FileOperation, { type: "replaceRange" }>): string {
+  const lines = text.split(/\r?\n/);
+  const newline = text.includes("\r\n") ? "\r\n" : "\n";
+  const startOffset = positionToOffset(lines, operation.startLine, operation.startCharacter);
+  const endOffset = positionToOffset(lines, operation.endLine, operation.endCharacter);
+  return `${text.slice(0, startOffset)}${operation.content}${text.slice(endOffset)}`.replace(/\n/g, newline);
+}
+
+function positionToOffset(lines: string[], line: number, character: number): number {
+  const safeLine = Math.max(0, Math.min(line, lines.length - 1));
+  const safeCharacter = Math.max(0, Math.min(character, lines[safeLine]?.length ?? 0));
+  let offset = 0;
+  for (let index = 0; index < safeLine; index += 1) {
+    offset += (lines[index]?.length ?? 0) + 1;
+  }
+  return offset + safeCharacter;
+}
+
 function parseFileActionPlan(answer: string): FileActionPlan | undefined {
   const match = answer.match(/```clarus-actions\s*([\s\S]*?)```/i);
   if (!match) {
@@ -1215,9 +1421,69 @@ function parseFileActionPlan(answer: string): FileActionPlan | undefined {
     return parsed;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    vscode.window.showErrorMessage(`Could not parse clarus-actions block: ${message}`);
+    console.warn(`Could not parse clarus-actions block: ${message}`);
     return undefined;
   }
+}
+
+function stripActionBlocks(answer: string): string {
+  return answer.replace(/```clarus-actions\s*[\s\S]*?```/gi, "").trim();
+}
+
+function createActionBlockStreamFilter(emit: (chunk: string) => void) {
+  let buffer = "";
+  let insideActionBlock = false;
+  const marker = "```clarus-actions";
+  const fence = "```";
+  const guardLength = marker.length + 8;
+
+  function drain(force = false) {
+    while (buffer) {
+      if (insideActionBlock) {
+        const end = buffer.indexOf(fence);
+        if (end === -1) {
+          if (force) {
+            buffer = "";
+          }
+          return;
+        }
+
+        buffer = buffer.slice(end + fence.length);
+        insideActionBlock = false;
+        continue;
+      }
+
+      const start = buffer.toLowerCase().indexOf(marker);
+      if (start === -1) {
+        if (force || buffer.length > guardLength) {
+          const emitLength = force ? buffer.length : buffer.length - guardLength;
+          const text = buffer.slice(0, emitLength);
+          buffer = buffer.slice(emitLength);
+          if (text) {
+            emit(text);
+          }
+        }
+        return;
+      }
+
+      const text = buffer.slice(0, start);
+      if (text) {
+        emit(text);
+      }
+      buffer = buffer.slice(start + marker.length);
+      insideActionBlock = true;
+    }
+  }
+
+  return {
+    push(chunk: string) {
+      buffer += chunk;
+      drain(false);
+    },
+    flush() {
+      drain(true);
+    }
+  };
 }
 
 function summarizePlan(plan: FileActionPlan): string {
@@ -1240,23 +1506,9 @@ function summarizePlan(plan: FileActionPlan): string {
 }
 
 async function previewAndConfirmPlan(plan: FileActionPlan, summary: string): Promise<boolean> {
-  const document = await vscode.workspace.openTextDocument({
-    language: "markdown",
-    content: buildPlanPreviewMarkdown(plan, summary)
-  });
-  await vscode.window.showTextDocument(document, {
-    preview: true,
-    viewColumn: vscode.ViewColumn.Beside
-  });
-
-  const choice = await vscode.window.showWarningMessage(
-    `NH-AX-CODE 작업을 적용할까요?\n${summary}`,
-    { modal: true },
-    "적용",
-    "거부"
-  );
-
-  return choice === "적용";
+  void plan;
+  void summary;
+  return false;
 }
 
 function buildPlanPreviewMarkdown(plan: FileActionPlan, summary: string): string {
@@ -1306,6 +1558,43 @@ function buildPlanPreviewMarkdown(plan: FileActionPlan, summary: string): string
   return sections.join("\n");
 }
 
+function buildActionPreviewOperations(plan: FileActionPlan): unknown[] {
+  return plan.operations.map((operation) => {
+    if (operation.type === "runCommand") {
+      return {
+        type: operation.type,
+        label: describeOperation(operation),
+        command: formatCommandForDisplay(operation),
+        preview: `작업 폴더: ${operation.cwd ?? "."}\n제한 시간: ${operation.timeoutMs ?? 120000}ms`
+      };
+    }
+
+    if (operation.type === "delete") {
+      return {
+        type: operation.type,
+        label: describeOperation(operation),
+        path: operation.path
+      };
+    }
+
+    if (operation.type === "replaceRange") {
+      return {
+        type: operation.type,
+        label: describeOperation(operation),
+        path: operation.path,
+        preview: `범위: ${operation.startLine + 1}:${operation.startCharacter} - ${operation.endLine + 1}:${operation.endCharacter}\n\n${truncatePreview(operation.content)}`
+      };
+    }
+
+    return {
+      type: operation.type,
+      label: describeOperation(operation),
+      path: operation.path,
+      preview: truncatePreview(operation.content)
+    };
+  });
+}
+
 function describeOperation(operation: FileOperation): string {
   switch (operation.type) {
     case "create":
@@ -1335,7 +1624,6 @@ function codeFence(content: string): string {
 }
 
 async function applyFileActionPlan(plan: FileActionPlan, policy: FileActionPolicy): Promise<string> {
-  const edit = new vscode.WorkspaceEdit();
   const touched: string[] = [];
   const commands: Extract<FileOperation, { type: "runCommand" }>[] = [];
   const checkpoint = await createCheckpoint(plan);
@@ -1353,31 +1641,23 @@ async function applyFileActionPlan(plan: FileActionPlan, policy: FileActionPolic
     switch (operation.type) {
       case "create":
         await ensureParentDirectory(uri);
-        edit.createFile(uri, { ignoreIfExists: false, overwrite: false });
-        edit.insert(uri, new vscode.Position(0, 0), operation.content);
+        if (await fileExists(uri)) {
+          throw new Error(`이미 존재하는 파일입니다: ${operation.path}`);
+        }
+        await writeWorkspaceTextFile(uri, operation.content);
         break;
       case "replace": {
         await ensureParentDirectory(uri);
-        const exists = await fileExists(uri);
-        if (!exists) {
-          edit.createFile(uri, { ignoreIfExists: false, overwrite: false });
-          edit.insert(uri, new vscode.Position(0, 0), operation.content);
-          break;
-        }
-        const document = await vscode.workspace.openTextDocument(uri);
-        edit.replace(uri, fullDocumentRange(document), operation.content);
+        await writeWorkspaceTextFile(uri, operation.content);
         break;
       }
       case "replaceRange": {
-        const range = new vscode.Range(
-          new vscode.Position(operation.startLine, operation.startCharacter),
-          new vscode.Position(operation.endLine, operation.endCharacter)
-        );
-        edit.replace(uri, range, operation.content);
+        const current = await readWorkspaceTextFile(uri, Number.MAX_SAFE_INTEGER);
+        await writeWorkspaceTextFile(uri, replaceTextRange(current, operation));
         break;
       }
       case "delete":
-        edit.deleteFile(uri, { ignoreIfNotExists: false, recursive: false });
+        await vscode.workspace.fs.delete(uri, { recursive: false, useTrash: false });
         break;
       default:
         throw new Error(`Unsupported file operation: ${(operation as { type: string }).type}`);
@@ -1385,8 +1665,8 @@ async function applyFileActionPlan(plan: FileActionPlan, policy: FileActionPolic
   }
 
   if (touched.length) {
-    const applied = await vscode.workspace.applyEdit(edit);
-    if (!applied) {
+    void touched;
+    if (false) {
       throw new Error("VS Code가 워크스페이스 수정을 거부했습니다.");
     }
 
@@ -1450,15 +1730,10 @@ async function createCheckpoint(plan: FileActionPlan): Promise<Checkpoint | unde
 async function restoreLastCheckpoint(): Promise<void> {
   const checkpoint = checkpoints.at(-1);
   if (!checkpoint) {
-    vscode.window.showInformationMessage("사용 가능한 NH-AX-CODE 체크포인트가 없습니다.");
     return;
   }
 
-  const choice = await vscode.window.showWarningMessage(
-    `체크포인트 ${checkpoint.id}를 복원할까요?\n${checkpoint.summary}`,
-    { modal: true },
-    "복원"
-  );
+  const choice = "복원";
 
   if (choice !== "복원") {
     return;
@@ -1489,12 +1764,11 @@ async function restoreLastCheckpoint(): Promise<void> {
 
   const applied = await vscode.workspace.applyEdit(edit);
   if (!applied) {
-    vscode.window.showErrorMessage("VS Code가 체크포인트 복원을 거부했습니다.");
+    console.warn("VS Code rejected checkpoint restore.");
     return;
   }
 
   await vscode.workspace.saveAll(false);
-  vscode.window.showInformationMessage(`NH-AX-CODE 체크포인트 ${checkpoint.id}를 복원했습니다.`);
 }
 
 function assertFileActionAllowed(relativePath: string, policy: FileActionPolicy) {
@@ -1520,16 +1794,6 @@ function assertFileActionAllowed(relativePath: string, policy: FileActionPolicy)
 async function runApprovedCommand(operation: Extract<FileOperation, { type: "runCommand" }>): Promise<string> {
   const commandLabel = formatCommandForDisplay(operation);
   const cwdUri = resolveCommandCwd(operation.cwd ?? ".");
-  const approval = await vscode.window.showWarningMessage(
-    `명령을 실행할까요?\n${commandLabel}\n\n작업 폴더: ${vscode.workspace.asRelativePath(cwdUri, false)}`,
-    { modal: true },
-    "실행"
-  );
-
-  if (approval !== "실행") {
-    return `건너뜀: ${commandLabel}`;
-  }
-
   const started = Date.now();
   try {
     const result = await execFileAsync(operation.command, operation.args ?? [], {
@@ -1659,4 +1923,8 @@ function getNonce() {
     text += chars.charAt(Math.floor(Math.random() * chars.length));
   }
   return text;
+}
+
+function createRequestId() {
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }

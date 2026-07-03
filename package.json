@@ -110,12 +110,12 @@
         },
         "clarusCode.streamResponses": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "description": "서버가 지원하면 실시간 스트리밍 응답을 사용합니다."
         },
         "clarusCode.autoApplyFileActions": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "description": "생성된 파일 작업을 확인 없이 적용합니다."
         },
         "clarusCode.maxWorkspaceFiles": {

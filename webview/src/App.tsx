@@ -21,10 +21,26 @@ interface ModelFallback {
   usedModel: string;
 }
 
+interface TokenUsage {
+  input?: number;
+  output?: number;
+  total?: number;
+  estimated?: boolean;
+}
+
 interface HostMessage {
-  type: "chatChunk" | "chatDone" | "chatError" | "modelList" | "modelListError" | "modelFallback" | "workspaceEntries" | "workspaceEntriesError";
+  type:
+    | "chatChunk"
+    | "chatDone"
+    | "chatError"
+    | "chatUsage"
+    | "modelList"
+    | "modelListError"
+    | "modelFallback"
+    | "workspaceEntries"
+    | "workspaceEntriesError";
   requestId: string;
-  value?: string | string[] | WorkspaceEntry[] | ModelFallback;
+  value?: string | string[] | WorkspaceEntry[] | ModelFallback | TokenUsage;
 }
 
 const defaultModels = ["gpt-5.5", "5.5", "gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "o3", "o4-mini"];
@@ -39,10 +55,11 @@ export function App() {
   const [modelOptions, setModelOptions] = useState(defaultModels);
   const [modelStatus, setModelStatus] = useState("");
   const [endpointMode, setEndpointMode] = useState<EndpointMode>("auto");
-  const [streamResponses, setStreamResponses] = useState(false);
+  const [streamResponses, setStreamResponses] = useState(true);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>("workspace");
   const [planMode, setPlanMode] = useState(false);
   const [pendingRequestId, setPendingRequestId] = useState<string | null>(null);
+  const [lastUsage, setLastUsage] = useState<TokenUsage | null>(null);
   const [mentionOptions, setMentionOptions] = useState<WorkspaceEntry[]>([]);
   const [mentionRange, setMentionRange] = useState<{ start: number; end: number } | null>(null);
   const [mentionRequestId, setMentionRequestId] = useState<string | null>(null);
@@ -90,6 +107,11 @@ export function App() {
       }
 
       if (message.requestId !== pendingRequestId) {
+        return;
+      }
+
+      if (message.type === "chatUsage" && isTokenUsage(message.value)) {
+        setLastUsage(message.value);
         return;
       }
 
@@ -168,6 +190,7 @@ export function App() {
     setInput("");
     setMentionRange(null);
     setMentionOptions([]);
+    setLastUsage(null);
     setMessages(nextMessages);
     setPendingRequestId(requestId);
     vscode.postMessage({
@@ -225,6 +248,8 @@ export function App() {
         <strong>NH-AX-CODE</strong>
         <div className="topbar-actions">
           <span>{pendingRequestId ? "실행 중" : `${model} / ${endpointModeLabel(endpointMode)}`}</span>
+          <span>{streamResponses ? "실시간" : "일괄"}</span>
+          {lastUsage ? <span>{formatUsage(lastUsage)}</span> : null}
           <button className="ghost-button" type="button" title="대화 지우기" onClick={() => setMessages([])}>
             지우기
           </button>
@@ -311,7 +336,7 @@ export function App() {
                 <option value="workspace">워크스페이스 수정</option>
                 <option value="plan-only">계획만</option>
               </select>
-              <label className="toggle">
+              <label className="toggle" title="파일 변경 없이 계획만 받습니다.">
                 <input type="checkbox" checked={planMode} onChange={(event) => setPlanMode(event.target.checked)} />
                 계획
               </label>
@@ -341,6 +366,18 @@ function endpointModeLabel(endpointMode: EndpointMode) {
     return "완성";
   }
   return "자동";
+}
+
+function formatUsage(usage: TokenUsage) {
+  const prefix = usage.estimated ? "토큰 약 " : "토큰 ";
+  if (typeof usage.total === "number") {
+    return `${prefix}${usage.total.toLocaleString()}`;
+  }
+  const parts = [
+    typeof usage.input === "number" ? `입력 ${usage.input.toLocaleString()}` : "",
+    typeof usage.output === "number" ? `출력 ${usage.output.toLocaleString()}` : "",
+  ].filter(Boolean);
+  return parts.length ? parts.join(" / ") : "토큰 -";
 }
 
 function findActiveMention(value: string, cursorPosition: number) {
@@ -374,6 +411,15 @@ function isModelFallback(value: unknown): value is ModelFallback {
 
   const fallback = value as ModelFallback;
   return typeof fallback.failedModel === "string" && typeof fallback.usedModel === "string";
+}
+
+function isTokenUsage(value: unknown): value is TokenUsage {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const usage = value as TokenUsage;
+  return typeof usage.input === "number" || typeof usage.output === "number" || typeof usage.total === "number";
 }
 
 function isChatModel(model: string) {
