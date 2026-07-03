@@ -1,7 +1,7 @@
 {
   "name": "clarus-code",
   "displayName": "NH-AX-CODE",
-  "description": "VS Code 안에서 사용하는 사내 코드 에이전트.",
+  "description": "VS Code용 사내 코드 에이전트.",
   "version": "0.1.0",
   "publisher": "clarus",
   "engines": {
@@ -45,6 +45,10 @@
       {
         "command": "clarusCode.openPanel",
         "title": "NH-AX-CODE: 패널 열기"
+      },
+      {
+        "command": "clarusCode.restoreLastCheckpoint",
+        "title": "NH-AX-CODE: 최근 체크포인트 복원"
       }
     ],
     "menus": {
@@ -54,6 +58,9 @@
         },
         {
           "command": "clarusCode.openPanel"
+        },
+        {
+          "command": "clarusCode.restoreLastCheckpoint"
         }
       ]
     },
@@ -68,39 +75,55 @@
             "openai-compatible"
           ],
           "default": "openai",
-          "description": "NH-AX-CODE에서 사용할 모델 제공자."
+          "description": "사용할 모델 제공자입니다."
         },
         "clarusCode.apiKey": {
           "type": "string",
           "default": "",
-          "description": "선택한 제공자의 API 키. 사용자 설정에 저장하는 것을 권장합니다."
+          "description": "선택한 제공자의 API 키입니다."
         },
         "clarusCode.model": {
           "type": "string",
-          "default": "gpt-4.1",
-          "description": "사용할 모델 이름."
+          "default": "gpt-5.5",
+          "description": "기본 모델 이름입니다."
         },
         "clarusCode.openAICompatibleBaseUrl": {
           "type": "string",
           "default": "http://localhost:11434/v1",
-          "description": "OpenAI 호환 chat completions 기본 URL."
+          "description": "OpenAI 호환 API 기본 URL입니다."
         },
         "clarusCode.requestHeaders": {
           "type": "object",
           "default": {},
-          "description": "사내 게이트웨이 또는 OpenAI 호환 서버에 추가할 HTTP 헤더."
+          "description": "사내 게이트웨이에 추가로 보낼 HTTP 헤더입니다."
+        },
+        "clarusCode.endpointMode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "chat-completions",
+            "completions",
+            "responses"
+          ],
+          "default": "auto",
+          "description": "엔드포인트 모드입니다. 자동은 채팅, 응답, 완성 순서로 시도합니다."
+        },
+        "clarusCode.streamResponses": {
+          "type": "boolean",
+          "default": false,
+          "description": "서버가 지원하면 실시간 스트리밍 응답을 사용합니다."
         },
         "clarusCode.autoApplyFileActions": {
           "type": "boolean",
           "default": false,
-          "description": "모델이 생성한 파일 작업을 확인 없이 적용합니다."
+          "description": "생성된 파일 작업을 확인 없이 적용합니다."
         },
         "clarusCode.maxWorkspaceFiles": {
           "type": "number",
           "default": 80,
           "minimum": 10,
           "maximum": 500,
-          "description": "가벼운 컨텍스트로 포함할 최대 워크스페이스 파일 수."
+          "description": "컨텍스트에 포함할 워크스페이스 파일 경로의 최대 개수입니다."
         }
       }
     }

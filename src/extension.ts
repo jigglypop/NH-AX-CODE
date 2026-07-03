@@ -1,5 +1,7 @@
 import * as vscode from "vscode";
 import * as path from "path";
+import { execFile } from "child_process";
+import { promisify } from "util";
 
 type ChatRole = "system" | "user" | "assistant";
 
@@ -32,12 +34,15 @@ interface WebviewListWorkspaceEntriesMessage {
   query?: string;
 }
 
-type AgentPermissionMode = "scoped" | "workspace" | "full";
+type AgentPermissionMode = "scoped" | "workspace" | "full" | "plan-only";
+type OpenAIEndpointMode = "auto" | "chat-completions" | "completions" | "responses";
 
 interface WebviewAgentSettings {
   permissionMode?: AgentPermissionMode;
   planMode?: boolean;
   model?: string;
+  endpointMode?: OpenAIEndpointMode;
+  streamResponses?: boolean;
 }
 
 interface ProviderConfig {
@@ -47,13 +52,23 @@ interface ProviderConfig {
   compatibleBaseUrl: string;
   requestHeaders: Record<string, string>;
   autoApplyFileActions: boolean;
+  endpointMode: OpenAIEndpointMode;
+  streamResponses: boolean;
+}
+
+interface ModelCallResult {
+  content: string;
+  requestedModel: string;
+  usedModel: string;
+  streamed?: boolean;
 }
 
 type FileOperation =
   | { type: "create"; path: string; content: string }
   | { type: "replace"; path: string; content: string }
   | { type: "replaceRange"; path: string; startLine: number; startCharacter: number; endLine: number; endCharacter: number; content: string }
-  | { type: "delete"; path: string };
+  | { type: "delete"; path: string }
+  | { type: "runCommand"; command: string; args?: string[]; cwd?: string; timeoutMs?: number };
 
 interface FileActionPlan {
   summary?: string;
@@ -75,19 +90,38 @@ interface WorkspaceEntry {
   type: "file" | "folder";
 }
 
+interface CheckpointFile {
+  path: string;
+  existed: boolean;
+  content?: string;
+}
+
+interface Checkpoint {
+  id: string;
+  createdAt: string;
+  summary: string;
+  files: CheckpointFile[];
+}
+
 const SYSTEM_PROMPT = [
   "You are NH-AX-CODE, a careful coding assistant embedded in VS Code.",
   "Be concise, practical, and repository-aware.",
-  "When asked to change, create, edit, or delete files, return a clarus-actions JSON code block after a short summary.",
-  "The action block format is: ```clarus-actions {\"summary\":\"...\",\"operations\":[{\"type\":\"create|replace|replaceRange|delete\",\"path\":\"relative/path\",\"content\":\"...\"}]} ```.",
+  "When asked to change, create, edit, delete files, or run commands, return a clarus-actions JSON code block after a short summary.",
+  "The action block format is: ```clarus-actions {\"summary\":\"...\",\"operations\":[{\"type\":\"create|replace|replaceRange|delete|runCommand\",\"path\":\"relative/path\",\"content\":\"...\",\"command\":\"npm\",\"args\":[\"run\",\"build\"],\"cwd\":\".\"}]} ```.",
   "For replaceRange include startLine, startCharacter, endLine, and endCharacter as zero-based positions.",
-  "Only use relative paths. Do not operate outside the workspace.",
+  "For runCommand, provide command and args separately. Use cwd as a workspace-relative path.",
+  "Only use relative file paths. Do not operate outside the workspace.",
+  "After tool results are provided, continue only if another concrete action is needed. Otherwise answer with the final result and no clarus-actions block.",
   "If context is missing, ask one targeted question instead of guessing recklessly."
 ].join("\n");
 
 const MAX_MENTION_FILES = 80;
 const MAX_MENTION_FILE_CHARS = 12000;
 const MAX_MENTION_CONTEXT_CHARS = 50000;
+const MAX_AGENT_STEPS = 4;
+const FALLBACK_CHAT_MODELS = ["gpt-5.5", "5.5", "gpt-4.1", "gpt-4o", "gpt-4.1-mini", "gpt-4o-mini", "o4-mini", "o3"];
+const execFileAsync = promisify(execFile);
+const checkpoints: Checkpoint[] = [];
 
 export function activate(context: vscode.ExtensionContext) {
   const output = vscode.window.createOutputChannel("NH-AX-CODE");
@@ -101,7 +135,10 @@ export function activate(context: vscode.ExtensionContext) {
       output.appendLine("Opening NH-AX-CODE chat view.");
       await provider.revealChatView();
     }),
-    vscode.commands.registerCommand("clarusCode.openPanel", () => provider.openPanel())
+    vscode.commands.registerCommand("clarusCode.openPanel", () => provider.openPanel()),
+    vscode.commands.registerCommand("clarusCode.restoreLastCheckpoint", async () => {
+      await restoreLastCheckpoint();
+    })
   );
   output.appendLine(`Registered WebviewViewProvider: ${ChatViewProvider.viewType}`);
 }
@@ -192,6 +229,10 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     try {
       const settings = normalizeAgentSettings(message.settings);
       const mentionContext = await buildMentionContext(message.messages ?? []);
+      const policy = {
+        mode: settings.permissionMode,
+        scopePaths: mentionContext.scopePaths
+      };
       const chatMessages: ChatMessage[] = [
         {
           role: "system",
@@ -202,13 +243,43 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
           content: formatWebviewMessageContent(chatMessage)
         }))
       ];
-      const answer = await callModel(chatMessages, settings.model);
 
-      this.postBridgeMessage({ type: "chatChunk", requestId, value: answer });
-      await this.offerFileActions(requestId, answer, {
-        mode: settings.permissionMode,
-        scopePaths: mentionContext.scopePaths
-      }, settings.planMode);
+      for (let step = 0; step < MAX_AGENT_STEPS; step += 1) {
+        const result = await callModel(chatMessages, settings.model, settings.endpointMode, settings.streamResponses, (chunk) => {
+          this.postBridgeMessage({ type: "chatChunk", requestId, value: chunk });
+        });
+        this.postModelFallbackIfNeeded(requestId, result);
+
+        const answer = result.content;
+        if (!result.streamed) {
+          this.postBridgeMessage({ type: "chatChunk", requestId, value: step === 0 ? answer : `\n\n${answer}` });
+        }
+
+        const actionResult = await this.applyActionsForAgentStep(requestId, answer, policy, settings.planMode);
+        if (!actionResult) {
+          break;
+        }
+
+        chatMessages.push({ role: "assistant", content: answer });
+        chatMessages.push({
+          role: "user",
+          content: [
+            "작업 결과:",
+            actionResult,
+            "",
+            "Continue the task if more work is required. If the task is complete, provide a final concise summary without a clarus-actions block."
+          ].join("\n")
+        });
+
+        if (step === MAX_AGENT_STEPS - 1) {
+          this.postBridgeMessage({
+            type: "chatChunk",
+            requestId,
+            value: "\n\n작업 단계 한도에 도달했습니다. 현재 결과를 확인한 뒤 이어서 요청하세요."
+          });
+        }
+      }
+
       this.postBridgeMessage({ type: "chatDone", requestId });
     } catch (error) {
       const text = error instanceof Error ? error.message : String(error);
@@ -251,6 +322,48 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
       const text = error instanceof Error ? error.message : String(error);
       this.output.appendLine(`Webview message error: ${text}`);
     }
+  }
+
+  private postModelFallbackIfNeeded(requestId: string, result: ModelCallResult) {
+    if (result.usedModel === result.requestedModel) {
+      return;
+    }
+
+    this.postBridgeMessage({
+      type: "modelFallback",
+      requestId,
+      value: {
+        failedModel: result.requestedModel,
+        usedModel: result.usedModel
+      }
+    });
+  }
+
+  private async applyActionsForAgentStep(requestId: string, answer: string, policy: FileActionPolicy, planMode: boolean): Promise<string | undefined> {
+    const plan = parseFileActionPlan(answer);
+    if (!plan) {
+      return undefined;
+    }
+
+    if (planMode) {
+      const message = "계획 모드가 켜져 있어 작업을 적용하지 않았습니다.";
+      this.postBridgeMessage({ type: "chatChunk", requestId, value: `\n\n${message}` });
+      return undefined;
+    }
+
+    const config = getProviderConfig();
+    const summary = summarizePlan(plan);
+    const shouldApply = config.autoApplyFileActions ? true : await previewAndConfirmPlan(plan, summary);
+
+    if (!shouldApply) {
+      const message = "작업을 적용하지 않았습니다.";
+      this.postBridgeMessage({ type: "chatChunk", requestId, value: `\n\n${message}` });
+      return undefined;
+    }
+
+    const result = await applyFileActionPlan(plan, policy);
+    this.postBridgeMessage({ type: "chatChunk", requestId, value: `\n\n${result}` });
+    return result;
   }
 
   private async offerFileActions(requestId: string, answer: string, policy: FileActionPolicy, planMode: boolean) {
@@ -342,25 +455,46 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 }
 
-async function callModel(messages: ChatMessage[], modelOverride?: string): Promise<string> {
+async function callModel(
+  messages: ChatMessage[],
+  modelOverride?: string,
+  endpointModeOverride?: OpenAIEndpointMode,
+  streamResponsesOverride?: boolean,
+  onChunk?: (chunk: string) => void
+): Promise<ModelCallResult> {
   const config = getProviderConfig();
+  config.endpointMode = endpointModeOverride ?? config.endpointMode;
+  config.streamResponses = streamResponsesOverride ?? config.streamResponses;
 
   if (!config.apiKey && config.provider !== "openai-compatible") {
     throw new Error("채팅 전에 VS Code 설정에서 clarusCode.apiKey를 입력하세요.");
   }
 
   if (config.provider === "anthropic") {
-    return callAnthropic(config, messages, modelOverride);
+    const requestedModel = modelOverride || config.model;
+    return {
+      content: await callAnthropic(config, messages, requestedModel),
+      requestedModel,
+      usedModel: requestedModel
+    };
   }
 
-  return callOpenAICompatible(config, messages, modelOverride);
+  return callOpenAICompatible(config, messages, modelOverride, onChunk);
 }
 
-async function callOpenAICompatible(config: ProviderConfig, messages: ChatMessage[], modelOverride?: string): Promise<string> {
+async function callOpenAICompatible(config: ProviderConfig, messages: ChatMessage[], modelOverride?: string, onChunk?: (chunk: string) => void): Promise<ModelCallResult> {
   const baseUrl = config.provider === "openai" ? "https://api.openai.com/v1" : config.compatibleBaseUrl.replace(/\/$/, "");
   const model = modelOverride || config.model;
+  return callOpenAIEndpointRouter(baseUrl, config, messages, model, onChunk);
   if (!isChatCompletionModel(model, config.provider)) {
-    throw new Error(`${model}은 채팅 모델이 아닙니다. 하단 모델 목록에서 GPT/o 계열 채팅 모델을 선택하세요.`);
+    const completion = await requestTextCompletion(baseUrl, config, messages, model);
+    if (completion.ok) {
+      return {
+        content: await readCompletionResponse(completion),
+        requestedModel: model,
+        usedModel: model
+      };
+    }
   }
 
   const response = await requestChatCompletion(baseUrl, config, messages, model);
@@ -368,14 +502,18 @@ async function callOpenAICompatible(config: ProviderConfig, messages: ChatMessag
   if (!response.ok) {
     const text = await response.text();
     if (isNotChatModelError(response.status, text)) {
-      const fallbackModel = (await listModels()).find((candidate) => candidate !== model);
-      if (fallbackModel) {
-        const retry = await requestChatCompletion(baseUrl, config, messages, fallbackModel);
-        if (retry.ok) {
-          const data = await retry.json() as { choices?: Array<{ message?: { content?: string } }> };
-          const content = data.choices?.[0]?.message?.content?.trim() || "응답 내용이 없습니다.";
-          return `[${model} 대신 ${fallbackModel}로 재시도]\n\n${content}`;
-        }
+      const completion = await requestTextCompletion(baseUrl, config, messages, model);
+      if (completion.ok) {
+        return {
+          content: await readCompletionResponse(completion),
+          requestedModel: model,
+          usedModel: model
+        };
+      }
+
+      const fallback = await retryChatCompletionWithFallbackModels(baseUrl, config, messages, model);
+      if (fallback) {
+        return fallback as ModelCallResult;
       }
     }
 
@@ -383,7 +521,11 @@ async function callOpenAICompatible(config: ProviderConfig, messages: ChatMessag
   }
 
   const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-  return data.choices?.[0]?.message?.content?.trim() || "응답 내용이 없습니다.";
+  return {
+    content: data.choices?.[0]?.message?.content?.trim() || "응답 내용이 없습니다.",
+    requestedModel: model,
+    usedModel: model
+  };
 }
 
 async function requestChatCompletion(baseUrl: string, config: ProviderConfig, messages: ChatMessage[], model: string): Promise<Response> {
@@ -396,10 +538,275 @@ async function requestChatCompletion(baseUrl: string, config: ProviderConfig, me
     },
     body: JSON.stringify({
       model,
-      messages,
-      temperature: 0.2
+      messages
     })
   });
+}
+
+async function requestTextCompletion(baseUrl: string, config: ProviderConfig, messages: ChatMessage[], model: string): Promise<Response> {
+  return fetch(`${baseUrl}/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...config.requestHeaders,
+      ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {})
+    },
+    body: JSON.stringify({
+      model,
+      prompt: messagesToPrompt(messages),
+      max_tokens: 4096
+    })
+  });
+}
+
+async function callOpenAIEndpointRouter(
+  baseUrl: string,
+  config: ProviderConfig,
+  messages: ChatMessage[],
+  model: string,
+  onChunk?: (chunk: string) => void
+): Promise<ModelCallResult> {
+  const errors: string[] = [];
+  const endpoints = getOpenAIEndpointOrder(config.endpointMode);
+
+  for (const endpoint of endpoints) {
+    const response = await requestOpenAIEndpoint(baseUrl, config, messages, model, endpoint, config.streamResponses);
+    if (response.ok) {
+      const isSse = (response.headers.get("content-type") ?? "").includes("text/event-stream");
+      const content = await readOpenAIEndpointResponse(response, endpoint, onChunk);
+      return {
+        content,
+        requestedModel: model,
+        usedModel: model,
+        streamed: isSse && Boolean(onChunk)
+      };
+    }
+
+    const text = await response.text();
+    errors.push(`${endpoint}: ${response.status} ${text}`);
+    if (config.endpointMode !== "auto" && !isEndpointFallbackError(response.status, text)) {
+      break;
+    }
+  }
+
+  const fallback = await retryChatCompletionWithFallbackModels(baseUrl, config, messages, model);
+  if (fallback) {
+    return fallback;
+  }
+
+  throw new Error(`제공자 요청 실패. 시도한 엔드포인트: ${endpoints.join(", ")}.\n${errors.join("\n")}`);
+}
+
+async function requestOpenAIEndpoint(
+  baseUrl: string,
+  config: ProviderConfig,
+  messages: ChatMessage[],
+  model: string,
+  endpoint: Exclude<OpenAIEndpointMode, "auto">,
+  stream: boolean
+): Promise<Response> {
+  const pathByEndpoint: Record<Exclude<OpenAIEndpointMode, "auto">, string> = {
+    "chat-completions": "chat/completions",
+    completions: "completions",
+    responses: "responses"
+  };
+
+  return fetch(`${baseUrl}/${pathByEndpoint[endpoint]}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...config.requestHeaders,
+      ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {})
+    },
+    body: JSON.stringify(buildOpenAIEndpointBody(endpoint, messages, model, stream))
+  });
+}
+
+function buildOpenAIEndpointBody(endpoint: Exclude<OpenAIEndpointMode, "auto">, messages: ChatMessage[], model: string, stream: boolean): Record<string, unknown> {
+  if (endpoint === "chat-completions") {
+    return { model, messages, stream };
+  }
+
+  if (endpoint === "responses") {
+    return { model, input: messagesToPrompt(messages), max_output_tokens: 4096, stream };
+  }
+
+  return { model, prompt: messagesToPrompt(messages), max_tokens: 4096, stream };
+}
+
+async function readOpenAIEndpointResponse(response: Response, endpoint: Exclude<OpenAIEndpointMode, "auto">, onChunk?: (chunk: string) => void): Promise<string> {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType.includes("text/event-stream")) {
+    return readSseText(response, endpoint, onChunk);
+  }
+
+  const data = await response.json() as {
+    output_text?: string;
+    output?: Array<{ content?: Array<{ text?: string }> }>;
+    choices?: Array<{ text?: string; message?: { content?: string } }>;
+  };
+
+  const outputText = data.output_text?.trim();
+  if (outputText) {
+    return outputText;
+  }
+
+  const responseText = data.output
+    ?.flatMap((item) => item.content ?? [])
+    .map((item) => item.text)
+    .filter((text): text is string => Boolean(text))
+    .join("")
+    .trim();
+  if (responseText) {
+    return responseText;
+  }
+
+  return data.choices?.[0]?.text?.trim() || data.choices?.[0]?.message?.content?.trim() || "응답 내용이 없습니다.";
+}
+
+async function readSseText(response: Response, endpoint: Exclude<OpenAIEndpointMode, "auto">, onChunk?: (chunk: string) => void): Promise<string> {
+  if (!response.body) {
+    return "응답 내용이 없습니다.";
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let output = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split(/\r?\n\r?\n/);
+    buffer = events.pop() ?? "";
+
+    for (const event of events) {
+      for (const line of event.split(/\r?\n/)) {
+        if (!line.startsWith("data:")) {
+          continue;
+        }
+
+        const payload = line.slice(5).trim();
+        if (!payload || payload === "[DONE]") {
+          continue;
+        }
+
+        try {
+          const chunk = extractSsePayloadText(JSON.parse(payload), endpoint);
+          if (chunk) {
+            output += chunk;
+            onChunk?.(chunk);
+          }
+        } catch {
+          continue;
+        }
+      }
+    }
+  }
+
+  return output.trim() || "응답 내용이 없습니다.";
+}
+
+function extractSsePayloadText(payload: unknown, endpoint: Exclude<OpenAIEndpointMode, "auto">): string {
+  const data = payload as {
+    delta?: string;
+    text?: string;
+    content?: string;
+    output_text?: string;
+    message?: { content?: string | Array<{ text?: string }> };
+    output?: Array<{ content?: Array<{ text?: string }> }>;
+    choices?: Array<{ text?: string; delta?: { content?: string }; message?: { content?: string } }>;
+  };
+
+  if (endpoint === "responses") {
+    const outputText = data.output
+      ?.flatMap((item) => item.content ?? [])
+      .map((item) => item.text)
+      .filter((text): text is string => Boolean(text))
+      .join("");
+    return data.delta ?? data.text ?? data.content ?? data.output_text ?? outputText ?? "";
+  }
+
+  const messageContent = Array.isArray(data.message?.content)
+    ? data.message.content.map((item) => item.text).filter(Boolean).join("")
+    : data.message?.content;
+
+  return data.choices?.[0]?.delta?.content
+    ?? data.choices?.[0]?.text
+    ?? data.choices?.[0]?.message?.content
+    ?? data.delta
+    ?? data.text
+    ?? data.content
+    ?? data.output_text
+    ?? messageContent
+    ?? "";
+}
+
+function getOpenAIEndpointOrder(endpointMode: OpenAIEndpointMode): Array<Exclude<OpenAIEndpointMode, "auto">> {
+  if (endpointMode === "chat-completions") {
+    return ["chat-completions", "responses", "completions"];
+  }
+
+  if (endpointMode === "responses") {
+    return ["responses", "chat-completions", "completions"];
+  }
+
+  if (endpointMode === "completions") {
+    return ["completions", "chat-completions", "responses"];
+  }
+
+  return ["chat-completions", "responses", "completions"];
+}
+
+async function readCompletionResponse(response: Response): Promise<string> {
+  const data = await response.json() as { choices?: Array<{ text?: string; message?: { content?: string } }> };
+  return data.choices?.[0]?.text?.trim() || data.choices?.[0]?.message?.content?.trim() || "응답 내용이 없습니다.";
+}
+
+function messagesToPrompt(messages: ChatMessage[]): string {
+  return [
+    ...messages.map((message) => `${message.role.toUpperCase()}:\n${message.content}`),
+    "ASSISTANT:"
+  ].join("\n\n");
+}
+
+async function retryChatCompletionWithFallbackModels(
+  baseUrl: string,
+  config: ProviderConfig,
+  messages: ChatMessage[],
+  failedModel: string
+): Promise<ModelCallResult | undefined> {
+  const candidates = uniqueStrings([
+    ...(await listModels().catch(() => [])),
+    config.model,
+    ...FALLBACK_CHAT_MODELS
+  ])
+    .filter((candidate) => candidate !== failedModel)
+    .filter((candidate) => isChatCompletionModel(candidate, config.provider));
+
+  for (const candidate of candidates) {
+    const retry = await requestChatCompletion(baseUrl, config, messages, candidate);
+    if (retry.ok) {
+      const data = await retry.json() as { choices?: Array<{ message?: { content?: string } }> };
+      const content = data.choices?.[0]?.message?.content?.trim() || "응답 내용이 없습니다.";
+      return {
+        content: `[${failedModel}은 채팅 모델이 아니어서 ${candidate}로 재시도했습니다]\n\n${content}`,
+        requestedModel: failedModel,
+        usedModel: candidate
+      };
+    }
+
+    const retryText = await retry.text();
+    if (isNotChatModelError(retry.status, retryText)) {
+      continue;
+    }
+  }
+
+  return undefined;
 }
 
 async function callAnthropic(config: ProviderConfig, messages: ChatMessage[], modelOverride?: string): Promise<string> {
@@ -420,8 +827,7 @@ async function callAnthropic(config: ProviderConfig, messages: ChatMessage[], mo
       model: modelOverride || config.model,
       system,
       messages: chatMessages,
-      max_tokens: 4096,
-      temperature: 0.2
+      max_tokens: 4096
     })
   });
 
@@ -438,10 +844,12 @@ function getProviderConfig(): ProviderConfig {
   return {
     provider: config.get<ProviderConfig["provider"]>("provider", "openai"),
     apiKey: config.get<string>("apiKey", ""),
-    model: config.get<string>("model", "gpt-4.1"),
+    model: config.get<string>("model", "gpt-5.5"),
     compatibleBaseUrl: config.get<string>("openAICompatibleBaseUrl", "http://localhost:11434/v1"),
     requestHeaders: config.get<Record<string, string>>("requestHeaders", {}),
-    autoApplyFileActions: config.get<boolean>("autoApplyFileActions", false)
+    autoApplyFileActions: config.get<boolean>("autoApplyFileActions", false),
+    endpointMode: config.get<OpenAIEndpointMode>("endpointMode", "auto"),
+    streamResponses: config.get<boolean>("streamResponses", false)
   };
 }
 
@@ -478,7 +886,11 @@ async function listModels(): Promise<string[]> {
     .sort((a, b) => a.localeCompare(b));
 
   const configuredModel = isChatCompletionModel(config.model, config.provider) ? [config.model] : [];
-  return [...configuredModel, ...models.filter((model) => model !== config.model)];
+  return uniqueStrings([...configuredModel, ...models.filter((model) => model !== config.model), ...FALLBACK_CHAT_MODELS]);
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
 }
 
 function isChatCompletionModel(model: string, provider: ProviderConfig["provider"]): boolean {
@@ -517,6 +929,10 @@ function isNotChatModelError(status: number, text: string): boolean {
   return (status === 400 || status === 404) && /not a chat model|v1\/chat\/completions|v1\/completions/i.test(text);
 }
 
+function isEndpointFallbackError(status: number, text: string): boolean {
+  return (status === 400 || status === 404 || status === 405) && /not a chat model|not supported|v1\/chat\/completions|v1\/completions|v1\/responses|did you mean/i.test(text);
+}
+
 function formatWebviewMessageContent(message: WebviewChatMessage): string {
   const attachmentSummary = message.attachments?.length
     ? `\n\nAttachments:\n${message.attachments.map((attachment) => `- ${attachment.name} (${attachment.type})`).join("\n")}`
@@ -526,15 +942,25 @@ function formatWebviewMessageContent(message: WebviewChatMessage): string {
 }
 
 function normalizeAgentSettings(settings?: WebviewAgentSettings): Required<WebviewAgentSettings> {
-  const permissionMode = settings?.permissionMode === "workspace" || settings?.permissionMode === "full"
+  const permissionMode = settings?.permissionMode === "workspace" || settings?.permissionMode === "full" || settings?.permissionMode === "plan-only"
     ? settings.permissionMode
-    : "scoped";
+    : "workspace";
 
   return {
     permissionMode,
-    planMode: settings?.planMode ?? false,
-    model: settings?.model?.trim() || getProviderConfig().model
+    planMode: permissionMode === "plan-only" ? true : settings?.planMode ?? false,
+    model: settings?.model?.trim() || getProviderConfig().model,
+    endpointMode: normalizeEndpointMode(settings?.endpointMode),
+    streamResponses: settings?.streamResponses ?? false
   };
+}
+
+function normalizeEndpointMode(endpointMode?: OpenAIEndpointMode): OpenAIEndpointMode {
+  if (endpointMode === "chat-completions" || endpointMode === "completions" || endpointMode === "responses") {
+    return endpointMode;
+  }
+
+  return "auto";
 }
 
 function buildSystemPrompt(settings: Required<WebviewAgentSettings>, mentionContext: MentionContext): string {
@@ -805,17 +1231,121 @@ function summarizePlan(plan: FileActionPlan): string {
         return `Edit ${operation.path}:${operation.startLine + 1}`;
       case "delete":
         return `Delete ${operation.path}`;
+      case "runCommand":
+        return `Run ${formatCommandForDisplay(operation)}`;
     }
   });
 
   return [plan.summary, ...lines].filter(Boolean).join("\n");
 }
 
+async function previewAndConfirmPlan(plan: FileActionPlan, summary: string): Promise<boolean> {
+  const document = await vscode.workspace.openTextDocument({
+    language: "markdown",
+    content: buildPlanPreviewMarkdown(plan, summary)
+  });
+  await vscode.window.showTextDocument(document, {
+    preview: true,
+    viewColumn: vscode.ViewColumn.Beside
+  });
+
+  const choice = await vscode.window.showWarningMessage(
+    `NH-AX-CODE 작업을 적용할까요?\n${summary}`,
+    { modal: true },
+    "적용",
+    "거부"
+  );
+
+  return choice === "적용";
+}
+
+function buildPlanPreviewMarkdown(plan: FileActionPlan, summary: string): string {
+  const sections = [
+    "# NH-AX-CODE 작업 미리보기",
+    "",
+    "## 요약",
+    "",
+    codeFence(summary || plan.summary || "요약 없음"),
+    "",
+    "## 작업 목록",
+    ""
+  ];
+
+  plan.operations.forEach((operation, index) => {
+    sections.push(`### ${index + 1}. ${describeOperation(operation)}`, "");
+
+    if (operation.type === "create" || operation.type === "replace") {
+      sections.push(`경로: \`${operation.path}\``, "", codeFence(truncatePreview(operation.content)), "");
+      return;
+    }
+
+    if (operation.type === "replaceRange") {
+      sections.push(
+        `경로: \`${operation.path}\``,
+        `범위: ${operation.startLine + 1}:${operation.startCharacter} - ${operation.endLine + 1}:${operation.endCharacter}`,
+        "",
+        codeFence(truncatePreview(operation.content)),
+        ""
+      );
+      return;
+    }
+
+    if (operation.type === "delete") {
+      sections.push(`경로: \`${operation.path}\``, "");
+      return;
+    }
+
+    sections.push(
+      `명령: \`${formatCommandForDisplay(operation)}\``,
+      `작업 폴더: \`${operation.cwd ?? "."}\``,
+      `제한 시간: ${operation.timeoutMs ?? 120000}ms`,
+      ""
+    );
+  });
+
+  return sections.join("\n");
+}
+
+function describeOperation(operation: FileOperation): string {
+  switch (operation.type) {
+    case "create":
+      return `생성 ${operation.path}`;
+    case "replace":
+      return `교체 ${operation.path}`;
+    case "replaceRange":
+      return `수정 ${operation.path}`;
+    case "delete":
+      return `삭제 ${operation.path}`;
+    case "runCommand":
+      return `실행 ${formatCommandForDisplay(operation)}`;
+  }
+}
+
+function truncatePreview(content: string): string {
+  const maxChars = 16000;
+  if (content.length <= maxChars) {
+    return content;
+  }
+
+  return `${content.slice(0, maxChars)}\n\n... ${content.length - maxChars}자 생략 ...`;
+}
+
+function codeFence(content: string): string {
+  return ["```", content.replace(/```/g, "'''"), "```"].join("\n");
+}
+
 async function applyFileActionPlan(plan: FileActionPlan, policy: FileActionPolicy): Promise<string> {
   const edit = new vscode.WorkspaceEdit();
   const touched: string[] = [];
+  const commands: Extract<FileOperation, { type: "runCommand" }>[] = [];
+  const checkpoint = await createCheckpoint(plan);
 
   for (const operation of plan.operations) {
+    if (operation.type === "runCommand") {
+      commands.push(operation);
+      continue;
+    }
+
     assertFileActionAllowed(operation.path, policy);
     const uri = resolveWorkspaceUri(operation.path);
     touched.push(`${operation.type} ${operation.path}`);
@@ -854,13 +1384,117 @@ async function applyFileActionPlan(plan: FileActionPlan, policy: FileActionPolic
     }
   }
 
+  if (touched.length) {
+    const applied = await vscode.workspace.applyEdit(edit);
+    if (!applied) {
+      throw new Error("VS Code가 워크스페이스 수정을 거부했습니다.");
+    }
+
+    await vscode.workspace.saveAll(false);
+  }
+
+  const commandResults: string[] = [];
+  for (const command of commands) {
+    commandResults.push(await runApprovedCommand(command));
+  }
+
+  const sections = [];
+  if (checkpoint) {
+    sections.push(`체크포인트 생성: ${checkpoint.id}`);
+  }
+  if (touched.length) {
+    sections.push(`적용된 파일 작업:\n${touched.map((item) => `- ${item}`).join("\n")}`);
+  }
+  if (commandResults.length) {
+    sections.push(`명령 실행 결과:\n${commandResults.join("\n\n")}`);
+  }
+
+  return sections.join("\n\n") || "적용된 파일 작업이 없습니다.";
+}
+
+async function createCheckpoint(plan: FileActionPlan): Promise<Checkpoint | undefined> {
+  const targetPaths = uniqueStrings(plan.operations
+    .filter((operation): operation is Exclude<FileOperation, { type: "runCommand" }> => operation.type !== "runCommand")
+    .map((operation) => operation.path));
+
+  if (!targetPaths.length) {
+    return undefined;
+  }
+
+  const files: CheckpointFile[] = [];
+  for (const relativePath of targetPaths) {
+    const uri = resolveWorkspaceUri(relativePath);
+    const existed = await fileExists(uri);
+    files.push({
+      path: relativePath,
+      existed,
+      content: existed ? await readWorkspaceTextFile(uri, Number.MAX_SAFE_INTEGER) : undefined
+    });
+  }
+
+  const checkpoint: Checkpoint = {
+    id: `${Date.now()}`,
+    createdAt: new Date().toISOString(),
+    summary: plan.summary ?? summarizePlan(plan),
+    files
+  };
+
+  checkpoints.push(checkpoint);
+  while (checkpoints.length > 20) {
+    checkpoints.shift();
+  }
+
+  return checkpoint;
+}
+
+async function restoreLastCheckpoint(): Promise<void> {
+  const checkpoint = checkpoints.at(-1);
+  if (!checkpoint) {
+    vscode.window.showInformationMessage("사용 가능한 NH-AX-CODE 체크포인트가 없습니다.");
+    return;
+  }
+
+  const choice = await vscode.window.showWarningMessage(
+    `체크포인트 ${checkpoint.id}를 복원할까요?\n${checkpoint.summary}`,
+    { modal: true },
+    "복원"
+  );
+
+  if (choice !== "복원") {
+    return;
+  }
+
+  const edit = new vscode.WorkspaceEdit();
+  for (const file of checkpoint.files) {
+    const uri = resolveWorkspaceUri(file.path);
+    const exists = await fileExists(uri);
+
+    if (!file.existed) {
+      if (exists) {
+        edit.deleteFile(uri, { ignoreIfNotExists: true, recursive: false });
+      }
+      continue;
+    }
+
+    await ensureParentDirectory(uri);
+    if (!exists) {
+      edit.createFile(uri, { ignoreIfExists: true, overwrite: true });
+      edit.insert(uri, new vscode.Position(0, 0), file.content ?? "");
+      continue;
+    }
+
+    const document = await vscode.workspace.openTextDocument(uri);
+    edit.replace(uri, fullDocumentRange(document), file.content ?? "");
+  }
+
   const applied = await vscode.workspace.applyEdit(edit);
   if (!applied) {
-    throw new Error("VS Code rejected the workspace edit.");
+    vscode.window.showErrorMessage("VS Code가 체크포인트 복원을 거부했습니다.");
+    return;
   }
 
   await vscode.workspace.saveAll(false);
-  return `Applied file actions:\n${touched.map((item) => `- ${item}`).join("\n")}`;
+  vscode.window.showInformationMessage(`NH-AX-CODE 체크포인트 ${checkpoint.id}를 복원했습니다.`);
 }
 
 function assertFileActionAllowed(relativePath: string, policy: FileActionPolicy) {
@@ -869,7 +1503,7 @@ function assertFileActionAllowed(relativePath: string, policy: FileActionPolicy)
   }
 
   if (!policy.scopePaths.length) {
-    throw new Error("File action blocked. Mention a file or folder with @path, or switch permission mode to workspace/full.");
+    throw new Error("파일 작업이 차단되었습니다. @경로로 파일이나 폴더를 지정하거나 워크스페이스 수정 모드를 사용하세요.");
   }
 
   const normalizedTarget = normalizeRelativePath(relativePath);
@@ -879,8 +1513,78 @@ function assertFileActionAllowed(relativePath: string, policy: FileActionPolicy)
   });
 
   if (!allowed) {
-    throw new Error(`File action blocked outside @ scope: ${relativePath}`);
+    throw new Error(`@ 범위 밖 파일 작업이 차단되었습니다: ${relativePath}`);
   }
+}
+
+async function runApprovedCommand(operation: Extract<FileOperation, { type: "runCommand" }>): Promise<string> {
+  const commandLabel = formatCommandForDisplay(operation);
+  const cwdUri = resolveCommandCwd(operation.cwd ?? ".");
+  const approval = await vscode.window.showWarningMessage(
+    `명령을 실행할까요?\n${commandLabel}\n\n작업 폴더: ${vscode.workspace.asRelativePath(cwdUri, false)}`,
+    { modal: true },
+    "실행"
+  );
+
+  if (approval !== "실행") {
+    return `건너뜀: ${commandLabel}`;
+  }
+
+  const started = Date.now();
+  try {
+    const result = await execFileAsync(operation.command, operation.args ?? [], {
+      cwd: cwdUri.fsPath,
+      timeout: Math.min(Math.max(operation.timeoutMs ?? 120000, 1000), 600000),
+      windowsHide: true,
+      maxBuffer: 1024 * 1024 * 4
+    });
+
+    return [
+      `$ ${commandLabel}`,
+      `exit 0 in ${Date.now() - started}ms`,
+      formatCommandOutput("stdout", result.stdout),
+      formatCommandOutput("stderr", result.stderr)
+    ].filter(Boolean).join("\n");
+  } catch (error) {
+    const commandError = error as {
+      code?: number | string;
+      signal?: string;
+      stdout?: string | Buffer;
+      stderr?: string | Buffer;
+      message?: string;
+    };
+
+    return [
+      `$ ${commandLabel}`,
+      `exit ${commandError.code ?? commandError.signal ?? "error"} in ${Date.now() - started}ms`,
+      commandError.message ? `error:\n${commandError.message}` : "",
+      formatCommandOutput("stdout", commandError.stdout),
+      formatCommandOutput("stderr", commandError.stderr)
+    ].filter(Boolean).join("\n");
+  }
+}
+
+function resolveCommandCwd(relativePath: string): vscode.Uri {
+  const uri = resolveWorkspaceUri(relativePath || ".");
+  return uri;
+}
+
+function formatCommandForDisplay(operation: Extract<FileOperation, { type: "runCommand" }>): string {
+  return [operation.command, ...(operation.args ?? [])].map(quoteCommandPart).join(" ");
+}
+
+function quoteCommandPart(value: string): string {
+  return /\s/.test(value) ? JSON.stringify(value) : value;
+}
+
+function formatCommandOutput(label: string, value: string | Buffer | undefined): string {
+  const text = Buffer.isBuffer(value) ? value.toString("utf8") : value ?? "";
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  return `${label}:\n${trimmed.slice(0, 12000)}`;
 }
 
 function normalizeRelativePath(relativePath: string): string {
@@ -914,7 +1618,7 @@ function resolveWorkspaceUri(relativePath: string): vscode.Uri {
   }
 
   if (!relativePath || path.isAbsolute(relativePath)) {
-    throw new Error(`File action path must be relative: ${relativePath}`);
+    throw new Error(`파일 작업 경로는 워크스페이스 상대 경로여야 합니다: ${relativePath}`);
   }
 
   const root = workspaceFolder.uri.fsPath;
@@ -923,7 +1627,7 @@ function resolveWorkspaceUri(relativePath: string): vscode.Uri {
   const insideRoot = target === normalizedRoot || target.startsWith(`${normalizedRoot}${path.sep}`);
 
   if (!insideRoot) {
-    throw new Error(`File action path escapes the workspace: ${relativePath}`);
+    throw new Error(`파일 작업 경로가 워크스페이스 밖으로 벗어납니다: ${relativePath}`);
   }
 
   return vscode.Uri.file(target);
