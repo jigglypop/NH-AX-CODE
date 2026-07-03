@@ -1,0 +1,325 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Pretendard", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  --color-nh-blue: #005bac;
+  --color-nh-sky: #0072ce;
+  --color-nh-green: #00a651;
+  --color-nh-teal: #007f6d;
+  --color-ink: #14251f;
+  --color-muted-ink: #60746d;
+  --animate-intro-drop: intro-drop 0.58s ease-out both;
+  --animate-fade-in: fade-in 0.18s ease both;
+  --animate-drop-up-menu: drop-up-menu 0.14s ease-out both;
+  --animate-panel-content: panel-content 0.16s ease-out both;
+  --animate-typing: typing 1.2s infinite;
+}
+
+@keyframes intro-drop {
+  from {
+    opacity: 0;
+    transform: translateY(-12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes drop-up-menu {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes panel-content {
+  from {
+    opacity: 0;
+    transform: translateX(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes typing {
+  0%,
+  60%,
+  100% {
+    opacity: 0.35;
+  }
+  30% {
+    opacity: 1;
+  }
+}
+
+@layer base {
+  :root {
+    --background: var(--vscode-editor-background, #1e1e1e);
+    --foreground: var(--vscode-foreground, #d4d4d4);
+    --card: var(--vscode-sideBar-background, var(--vscode-editor-background, #1e1e1e));
+    --card-foreground: var(--vscode-foreground, #d4d4d4);
+    --muted: var(--vscode-input-background, rgba(127, 127, 127, 0.12));
+    --muted-foreground: var(--vscode-descriptionForeground, #9a9a9a);
+    --border: var(--vscode-panel-border, rgba(127, 127, 127, 0.35));
+    --input: var(--vscode-input-border, var(--vscode-panel-border, rgba(127, 127, 127, 0.35)));
+    --primary: var(--vscode-button-background, #0e639c);
+    --primary-foreground: var(--vscode-button-foreground, #ffffff);
+    --sidebar: var(--vscode-sideBar-background, var(--vscode-editor-background, #1e1e1e));
+    --sidebar-foreground: var(--vscode-sideBar-foreground, var(--vscode-foreground, #d4d4d4));
+    --radius: 0.5rem;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  html,
+  body,
+  #root {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    font-family: var(--font-sans);
+  }
+
+  body {
+    min-width: 320px;
+    overflow: hidden;
+    background: var(--background);
+    color: var(--foreground);
+  }
+
+  button,
+  textarea,
+  input,
+  select {
+    font: inherit;
+  }
+
+  button {
+    cursor: pointer;
+    transition-duration: 0.16s;
+    transition-property: background-color, border-color, box-shadow, color, opacity, transform, filter;
+    transition-timing-function: ease;
+  }
+
+  button:not(:disabled):hover {
+    filter: saturate(1.04);
+  }
+
+  button:not(:disabled):active {
+    transform: scale(0.98);
+    filter: saturate(1);
+  }
+
+  button:disabled {
+    cursor: not-allowed;
+  }
+}
+
+#root,
+[class*="bg-white"],
+[class*="bg-[#fb"],
+[class*="bg-[#f1"],
+[class*="bg-[#f3"],
+[class*="bg-[#f5"],
+[class*="bg-[#f6"],
+[class*="bg-[#f7"],
+[class*="bg-[#f8"] {
+  background-color: var(--card) !important;
+}
+
+[class*="text-ink"],
+[class*="text-[#202124]"],
+[class*="text-[#14251f]"],
+[class*="text-[#3c4043]"] {
+  color: var(--foreground) !important;
+}
+
+[class*="text-muted-ink"],
+[class*="text-[#5f6368]"],
+[class*="text-[#60746d]"],
+[class*="text-[#6b7280]"],
+[class*="text-[#8a9993]"],
+[class*="text-[#8b949e]"] {
+  color: var(--muted-foreground) !important;
+}
+
+[class*="border-[#"],
+[class*="border-nh"] {
+  border-color: var(--border) !important;
+}
+
+textarea,
+input,
+select {
+  background-color: var(--vscode-input-background, var(--card)) !important;
+  color: var(--vscode-input-foreground, var(--foreground)) !important;
+  border-color: var(--vscode-input-border, var(--border)) !important;
+}
+
+.boot-error {
+  padding: 16px;
+  line-height: 1.5;
+  color: #14251f;
+}
+
+.boot-error strong {
+  display: block;
+  margin-bottom: 8px;
+}
+
+.boot-error p,
+.boot-error pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.boot-error pre {
+  margin-top: 12px;
+  max-height: 65vh;
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid #dfe8e3;
+  border-radius: 6px;
+  background: #f7fbf9;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+@layer components {
+  .nh-scrollbar::-webkit-scrollbar {
+    width: 8px;
+  }
+
+  .nh-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .nh-scrollbar::-webkit-scrollbar-thumb {
+    background: #dce4e0;
+    border-radius: 999px;
+  }
+
+  .nh-date-time-picker {
+    display: block;
+    width: 100%;
+  }
+
+  .nh-date-time-popper {
+    z-index: 50;
+  }
+
+  .nh-date-time-calendar {
+    overflow: hidden;
+    border: 1px solid #dbe3df;
+    border-radius: 8px;
+    box-shadow: 0 16px 36px rgb(20 37 31 / 14%);
+    color: #14251f;
+    font-family: var(--font-sans);
+  }
+
+  .nh-date-time-calendar .react-datepicker__header {
+    border-bottom: 1px solid #e5ece8;
+    background: #f7fbf9;
+    padding-top: 10px;
+  }
+
+  .nh-date-time-calendar .react-datepicker__current-month,
+  .nh-date-time-calendar .react-datepicker-time__header {
+    color: #14251f;
+    font-size: 13px;
+    font-weight: 800;
+  }
+
+  .nh-date-time-calendar .react-datepicker__day-name,
+  .nh-date-time-calendar .react-datepicker__day,
+  .nh-date-time-calendar .react-datepicker__time-name {
+    width: 2rem;
+    line-height: 2rem;
+    margin: 0.08rem;
+    color: #34443e;
+    font-size: 12px;
+    font-weight: 650;
+  }
+
+  .nh-date-time-calendar .react-datepicker__day-name {
+    color: #60746d;
+    font-size: 11px;
+  }
+
+  .nh-date-time-calendar .react-datepicker__day:hover,
+  .nh-date-time-calendar .react-datepicker__time-list-item:hover {
+    border-radius: 7px;
+    background: #edf6f2;
+  }
+
+  .nh-date-time-calendar .react-datepicker__day--selected,
+  .nh-date-time-calendar .react-datepicker__day--keyboard-selected,
+  .nh-date-time-calendar .react-datepicker__day--in-selecting-range,
+  .nh-date-time-calendar .react-datepicker__day--in-range {
+    border-radius: 7px;
+    background: #005bac;
+    color: #ffffff;
+  }
+
+  .nh-date-time-calendar .react-datepicker__day--outside-month {
+    color: #a2afa9;
+  }
+
+  .nh-date-time-calendar .react-datepicker__time-container {
+    border-left: 1px solid #e5ece8;
+  }
+
+  .nh-date-time-calendar .react-datepicker__time-container,
+  .nh-date-time-calendar .react-datepicker__time,
+  .nh-date-time-calendar .react-datepicker__time-box {
+    width: 78px;
+  }
+
+  .nh-date-time-calendar .react-datepicker__time-list {
+    height: 214px !important;
+  }
+
+  .nh-date-time-calendar .react-datepicker__time-list-item {
+    height: 30px !important;
+    padding: 6px 8px !important;
+    color: #34443e;
+    font-size: 12px;
+    font-weight: 650;
+  }
+
+  .nh-date-time-calendar .react-datepicker__time-list-item--selected {
+    background: #005bac !important;
+    color: #ffffff !important;
+    font-weight: 800 !important;
+  }
+
+  .nh-date-time-calendar .react-datepicker__today-button {
+    border-top: 1px solid #e5ece8;
+    background: #ffffff;
+    color: #005bac;
+    font-size: 12px;
+    font-weight: 800;
+  }
+}

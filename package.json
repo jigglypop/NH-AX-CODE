@@ -1,0 +1,143 @@
+{
+  "name": "clarus-code",
+  "displayName": "NH-AX-CODE",
+  "description": "VS Code 안에서 사용하는 사내 코드 에이전트.",
+  "version": "0.1.0",
+  "publisher": "clarus",
+  "engines": {
+    "vscode": "^1.92.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "*",
+    "onStartupFinished",
+    "onView:clarusCode.chat",
+    "onCommand:clarusCode.openChat",
+    "onCommand:clarusCode.openPanel"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "clarusCode",
+          "title": "NH-AX-CODE",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "clarusCode": [
+        {
+          "type": "webview",
+          "id": "clarusCode.chat",
+          "name": "채팅"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "clarusCode.openChat",
+        "title": "NH-AX-CODE: 채팅 열기"
+      },
+      {
+        "command": "clarusCode.openPanel",
+        "title": "NH-AX-CODE: 패널 열기"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "clarusCode.openChat"
+        },
+        {
+          "command": "clarusCode.openPanel"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "NH-AX-CODE",
+      "properties": {
+        "clarusCode.provider": {
+          "type": "string",
+          "enum": [
+            "openai",
+            "anthropic",
+            "openai-compatible"
+          ],
+          "default": "openai",
+          "description": "NH-AX-CODE에서 사용할 모델 제공자."
+        },
+        "clarusCode.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "선택한 제공자의 API 키. 사용자 설정에 저장하는 것을 권장합니다."
+        },
+        "clarusCode.model": {
+          "type": "string",
+          "default": "gpt-4.1",
+          "description": "사용할 모델 이름."
+        },
+        "clarusCode.openAICompatibleBaseUrl": {
+          "type": "string",
+          "default": "http://localhost:11434/v1",
+          "description": "OpenAI 호환 chat completions 기본 URL."
+        },
+        "clarusCode.requestHeaders": {
+          "type": "object",
+          "default": {},
+          "description": "사내 게이트웨이 또는 OpenAI 호환 서버에 추가할 HTTP 헤더."
+        },
+        "clarusCode.autoApplyFileActions": {
+          "type": "boolean",
+          "default": false,
+          "description": "모델이 생성한 파일 작업을 확인 없이 적용합니다."
+        },
+        "clarusCode.maxWorkspaceFiles": {
+          "type": "number",
+          "default": 80,
+          "minimum": 10,
+          "maximum": 500,
+          "description": "가벼운 컨텍스트로 포함할 최대 워크스페이스 파일 수."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "npm run compile:webview && npm run compile:extension",
+    "compile:extension": "tsc -p ./",
+    "compile:webview": "vite build --config webview/vite.config.ts",
+    "dev:webview": "vite --config webview/vite.config.ts --host 127.0.0.1",
+    "watch": "tsc -watch -p ./",
+    "watch:extension": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.2",
+    "@types/node": "^20.14.12",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@types/vscode": "^1.92.0",
+    "@vitejs/plugin-react": "^6.0.3",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.5.4",
+    "vite": "^8.1.3"
+  },
+  "dependencies": {
+    "@microsoft/fetch-event-source": "^2.0.1",
+    "@streamdown/cjk": "^1.0.3",
+    "@streamdown/code": "^1.1.1",
+    "@streamdown/mermaid": "^1.0.2",
+    "@tanstack/react-query": "^5.101.2",
+    "date-fns": "^4.4.0",
+    "jotai": "^2.20.1",
+    "pdfjs-dist": "^6.1.200",
+    "react-datepicker": "^9.1.0",
+    "read-excel-file": "^9.2.0",
+    "streamdown": "^2.5.0",
+    "tailwindcss": "^4.3.2"
+  }
+}
