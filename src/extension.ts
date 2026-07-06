@@ -1,13 +1,20 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import { execFile } from "child_process";
+import { execFile, spawn } from "child_process";
 import { promisify } from "util";
+import { ClosedLoopController, planSignature, type StepObservation } from "./agentLoop";
+import { McpManager, type McpServerConfig } from "./mcp";
 
-type ChatRole = "system" | "user" | "assistant";
+type ChatRole = "system" | "user" | "assistant" | "tool";
 
 interface ChatMessage {
   role: ChatRole;
   content: string;
+  /** Native function-calling passthrough (OpenAI chat-completions). */
+  tool_calls?: unknown;
+  tool_call_id?: string;
+  /** Anthropic native tool-use passthrough: raw content blocks for this turn. */
+  anthropicContent?: unknown;
 }
 
 interface WebviewChatMessage {
@@ -54,6 +61,14 @@ interface ProviderConfig {
   autoApplyFileActions: boolean;
   endpointMode: OpenAIEndpointMode;
   streamResponses: boolean;
+  toolMode: "actions-block" | "native";
+}
+
+interface NativeToolCall {
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+  raw: unknown;
 }
 
 interface ModelCallResult {
@@ -62,6 +77,9 @@ interface ModelCallResult {
   usedModel: string;
   streamed?: boolean;
   usage?: TokenUsage;
+  toolCalls?: NativeToolCall[];
+  /** Raw assistant payload for protocol-correct tool-result feedback. */
+  rawAssistant?: unknown;
 }
 
 type FileOperation =
@@ -69,7 +87,21 @@ type FileOperation =
   | { type: "replace"; path: string; content: string }
   | { type: "replaceRange"; path: string; startLine: number; startCharacter: number; endLine: number; endCharacter: number; content: string }
   | { type: "delete"; path: string }
-  | { type: "runCommand"; command: string; args?: string[]; cwd?: string; timeoutMs?: number };
+  | { type: "runCommand"; command: string; args?: string[]; cwd?: string; timeoutMs?: number }
+  | { type: "readFile"; path: string; startLine?: number; endLine?: number }
+  | { type: "listDir"; path: string }
+  | { type: "searchText"; pattern: string; path?: string; maxResults?: number }
+  | { type: "mcpTool"; server: string; tool: string; arguments?: Record<string, unknown> }
+  | { type: "subagent"; task: string; context?: string };
+
+type ReadOnlyOperation = Extract<FileOperation, { type: "readFile" | "listDir" | "searchText" | "subagent" }>;
+
+// Read-only in the sense of "safe in plan mode": subagents are analysis-only
+// nested loops (their own mutations are blocked). mcpTool may mutate external
+// state, so it is NOT read-only.
+function isReadOnlyOperation(operation: FileOperation): operation is ReadOnlyOperation {
+  return operation.type === "readFile" || operation.type === "listDir" || operation.type === "searchText" || operation.type === "subagent";
+}
 
 interface FileActionPlan {
   summary?: string;
@@ -115,9 +147,13 @@ const SYSTEM_PROMPT = [
   "You are NH-AX-CODE, a careful coding assistant embedded in VS Code.",
   "Be concise, practical, and repository-aware.",
   "When asked to change, create, edit, delete files, or run commands, return a clarus-actions JSON code block after a short summary.",
-  "The action block format is: ```clarus-actions {\"summary\":\"...\",\"operations\":[{\"type\":\"create|replace|replaceRange|delete|runCommand\",\"path\":\"relative/path\",\"content\":\"...\",\"command\":\"npm\",\"args\":[\"run\",\"build\"],\"cwd\":\".\"}]} ```.",
+  "The action block format is: ```clarus-actions {\"summary\":\"...\",\"operations\":[{\"type\":\"create|replace|replaceRange|delete|runCommand|readFile|listDir|searchText\",\"path\":\"relative/path\",\"content\":\"...\",\"command\":\"npm\",\"args\":[\"run\",\"build\"],\"cwd\":\".\"}]} ```.",
   "For replaceRange include startLine, startCharacter, endLine, and endCharacter as zero-based positions.",
   "For runCommand, provide command and args separately. Use cwd as a workspace-relative path.",
+  "Read-only tools: readFile {path, startLine?, endLine?} returns file text; listDir {path} lists entries; searchText {pattern, path?, maxResults?} greps the workspace with a regex.",
+  "Prefer readFile/searchText to inspect current state BEFORE editing a file you have not seen, and after a failure to diagnose it.",
+  "subagent {task, context?} spawns a read-only analysis agent with its own loop and returns its findings — use for research subtasks that would bloat this conversation.",
+  "mcpTool {server, tool, arguments} calls a connected MCP tool. Available MCP tools, if any, are listed under 'MCP tools' below.",
   "Only use relative file paths. Do not operate outside the workspace.",
   "After tool results are provided, continue only if another concrete action is needed. Otherwise answer with the final result and no clarus-actions block.",
   "If context is missing, ask one targeted question instead of guessing recklessly."
@@ -126,18 +162,54 @@ const SYSTEM_PROMPT = [
 const MAX_MENTION_FILES = 80;
 const MAX_MENTION_FILE_CHARS = 12000;
 const MAX_MENTION_CONTEXT_CHARS = 50000;
-const MAX_AGENT_STEPS = 4;
+// Absolute cap on model/action rounds per turn. The effective budget is dynamic:
+// ClosedLoopController stretches from a soft budget of 4 up to this cap only
+// while the loop is making progress (F.3 dual-process depth).
+const HARD_AGENT_STEP_CAP = 8;
 const FALLBACK_CHAT_MODELS = ["gpt-5.5", "5.5", "gpt-4.1", "gpt-4o", "gpt-4.1-mini", "gpt-4o-mini", "o4-mini", "o3"];
 const execFileAsync = promisify(execFile);
-const checkpoints: Checkpoint[] = [];
+let checkpoints: Checkpoint[] = [];
+let extensionContext: vscode.ExtensionContext | undefined;
+
+const CHECKPOINT_STATE_KEY = "clarusCode.checkpoints";
+const COMMAND_HISTORY_STATE_KEY = "clarusCode.commandHistory";
+const ENDPOINT_CACHE_STATE_KEY = "clarusCode.endpointCache";
+const SESSION_STATE_KEY = "clarusCode.session";
+
+interface CommandHistoryEntry {
+  command: string;
+  cwd: string;
+  exit: string;
+  at: string;
+  durationMs: number;
+}
+
+/** Virtual documents for diff previews (proposed content / checkpoint content). */
+const virtualDocuments = new Map<string, string>();
+
+class VirtualDocumentProvider implements vscode.TextDocumentContentProvider {
+  static readonly scheme = "clarus-virtual";
+  provideTextDocumentContent(uri: vscode.Uri): string {
+    return virtualDocuments.get(uri.toString()) ?? "";
+  }
+}
+
+function makeVirtualUri(kind: string, label: string, content: string): vscode.Uri {
+  const uri = vscode.Uri.parse(`${VirtualDocumentProvider.scheme}:/${kind}/${Date.now()}/${label.replace(/\\/g, "/")}`);
+  virtualDocuments.set(uri.toString(), content);
+  return uri;
+}
 
 export function activate(context: vscode.ExtensionContext) {
+  extensionContext = context;
+  checkpoints = context.workspaceState.get<Checkpoint[]>(CHECKPOINT_STATE_KEY, []);
   const output = vscode.window.createOutputChannel("NH-AX-CODE");
   output.appendLine("Activating NH-AX-CODE.");
   const provider = new ChatViewProvider(context.extensionUri, output);
 
   context.subscriptions.push(
     output,
+    vscode.workspace.registerTextDocumentContentProvider(VirtualDocumentProvider.scheme, new VirtualDocumentProvider()),
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, provider),
     vscode.commands.registerCommand("clarusCode.openChat", async () => {
       output.appendLine("Opening NH-AX-CODE chat view.");
@@ -146,9 +218,186 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("clarusCode.openPanel", () => provider.openPanel()),
     vscode.commands.registerCommand("clarusCode.restoreLastCheckpoint", async () => {
       await restoreLastCheckpoint();
+    }),
+    vscode.commands.registerCommand("clarusCode.listCheckpoints", async () => {
+      await showCheckpointList();
+    }),
+    vscode.commands.registerCommand("clarusCode.showCommandHistory", async () => {
+      await showCommandHistory();
+    }),
+    vscode.commands.registerCommand("clarusCode.probeEndpoints", async () => {
+      await probeEndpoints(output);
+    }),
+    vscode.commands.registerCommand("clarusCode.editPermissionRules", async () => {
+      await editPermissionRules();
+    }),
+    vscode.commands.registerCommand("clarusCode.gitCommit", async () => {
+      const result = await gitCommitWithAiMessage();
+      output.appendLine(result);
+      void vscode.window.showInformationMessage(result.split("\n")[0]);
+    }),
+    vscode.commands.registerCommand("clarusCode.reloadMcpServers", async () => {
+      await mcpManager?.restart(getMcpServerConfigs());
+      const tools = mcpManager?.allTools() ?? [];
+      void vscode.window.showInformationMessage(`MCP 재시작 완료: 도구 ${tools.length}개`);
     })
   );
+
+  mcpManager = new McpManager((line) => output.appendLine(line));
+  void mcpManager.sync(getMcpServerConfigs());
+  context.subscriptions.push({ dispose: () => mcpManager?.dispose() });
+
   output.appendLine(`Registered WebviewViewProvider: ${ChatViewProvider.viewType}`);
+}
+
+let mcpManager: McpManager | undefined;
+
+function getMcpServerConfigs(): Record<string, McpServerConfig> {
+  return vscode.workspace.getConfiguration("clarusCode").get<Record<string, McpServerConfig>>("mcpServers", {});
+}
+
+/** QuickPick-based editor for command allow/deny rules. */
+async function editPermissionRules(): Promise<void> {
+  const config = vscode.workspace.getConfiguration("clarusCode");
+
+  while (true) {
+    const listPick = await vscode.window.showQuickPick(
+      [
+        { label: `commandAllowlist (${config.get<string[]>("commandAllowlist", []).length})`, key: "commandAllowlist" as const },
+        { label: `commandDenylist (${config.get<string[]>("commandDenylist", []).length})`, key: "commandDenylist" as const }
+      ],
+      { placeHolder: "편집할 규칙 목록 선택 (Esc: 종료)" }
+    );
+    if (!listPick) {
+      return;
+    }
+
+    const rules = [...config.get<string[]>(listPick.key, [])];
+    const rulePick = await vscode.window.showQuickPick(
+      [
+        { label: "$(add) 규칙 추가", action: "add" as const, rule: "" },
+        ...rules.map((rule) => ({ label: `$(trash) ${rule}`, action: "remove" as const, rule }))
+      ],
+      { placeHolder: `${listPick.key} — 추가하거나 삭제할 규칙 선택` }
+    );
+    if (!rulePick) {
+      continue;
+    }
+
+    if (rulePick.action === "add") {
+      const value = await vscode.window.showInputBox({ prompt: "명령 접두사 (예: npm run, git status)" });
+      if (value?.trim()) {
+        rules.push(value.trim());
+        await config.update(listPick.key, rules, vscode.ConfigurationTarget.Workspace);
+      }
+    } else {
+      await config.update(listPick.key, rules.filter((rule) => rule !== rulePick.rule), vscode.ConfigurationTarget.Workspace);
+    }
+  }
+}
+
+/** Git workflow: stage everything, generate a commit message with the model, commit. */
+async function gitCommitWithAiMessage(): Promise<string> {
+  const status = await runApprovedCommand({ type: "runCommand", command: "git", args: ["status", "--porcelain"], cwd: "." });
+  if (!/stdout:/.test(status)) {
+    return "커밋할 변경이 없습니다.";
+  }
+
+  const diffStat = await runApprovedCommand({ type: "runCommand", command: "git", args: ["diff", "HEAD", "--stat"], cwd: "." });
+  const diff = await runApprovedCommand({ type: "runCommand", command: "git", args: ["diff", "HEAD"], cwd: "." });
+
+  const result = await callModel([
+    { role: "system", content: "You write git commit messages. Reply with ONLY the commit message: an imperative summary line under 72 chars, then optionally a blank line and short body. No code fences." },
+    { role: "user", content: `git status:\n${status.slice(0, 4000)}\n\n${diffStat.slice(0, 4000)}\n\ndiff (truncated):\n${diff.slice(0, 24000)}` }
+  ]);
+  const commitMessage = result.content.trim().replace(/^```[\s\S]*?\n|```$/g, "").trim();
+  if (!commitMessage) {
+    return "커밋 메시지 생성에 실패했습니다.";
+  }
+
+  const addResult = await runApprovedCommand({ type: "runCommand", command: "git", args: ["add", "-A"], cwd: "." });
+  if (!/exit 0 /.test(addResult)) {
+    return `git add 실패:\n${addResult}`;
+  }
+  const commitResult = await runApprovedCommand({ type: "runCommand", command: "git", args: ["commit", "-m", commitMessage], cwd: "." });
+  return [`커밋 메시지:\n${commitMessage}`, commitResult].join("\n\n");
+}
+
+async function persistCheckpoints(): Promise<void> {
+  await extensionContext?.workspaceState.update(CHECKPOINT_STATE_KEY, checkpoints);
+}
+
+async function recordCommandHistory(entry: CommandHistoryEntry): Promise<void> {
+  if (!extensionContext) {
+    return;
+  }
+  const history = extensionContext.globalState.get<CommandHistoryEntry[]>(COMMAND_HISTORY_STATE_KEY, []);
+  history.push(entry);
+  while (history.length > 100) {
+    history.shift();
+  }
+  await extensionContext.globalState.update(COMMAND_HISTORY_STATE_KEY, history);
+}
+
+async function showCommandHistory(): Promise<void> {
+  const history = extensionContext?.globalState.get<CommandHistoryEntry[]>(COMMAND_HISTORY_STATE_KEY, []) ?? [];
+  if (!history.length) {
+    void vscode.window.showInformationMessage("명령 실행 히스토리가 없습니다.");
+    return;
+  }
+  await vscode.window.showQuickPick(
+    [...history].reverse().map((entry) => ({
+      label: entry.command,
+      description: `exit ${entry.exit} · ${entry.durationMs}ms`,
+      detail: `${entry.at} · cwd ${entry.cwd}`
+    })),
+    { placeHolder: "명령 실행 히스토리 (최근 100건)" }
+  );
+}
+
+async function showCheckpointList(): Promise<void> {
+  if (!checkpoints.length) {
+    void vscode.window.showInformationMessage("저장된 체크포인트가 없습니다.");
+    return;
+  }
+
+  const picked = await vscode.window.showQuickPick(
+    [...checkpoints].reverse().map((checkpoint) => ({
+      label: checkpoint.summary || checkpoint.id,
+      description: checkpoint.createdAt,
+      detail: checkpoint.files.map((file) => file.path).join(", "),
+      checkpoint
+    })),
+    { placeHolder: "체크포인트 선택" }
+  );
+  if (!picked) {
+    return;
+  }
+
+  const action = await vscode.window.showQuickPick(
+    [
+      { label: "$(diff) 복원 전 diff 보기", value: "diff" as const },
+      { label: "$(history) 이 체크포인트로 복원", value: "restore" as const }
+    ],
+    { placeHolder: picked.checkpoint.summary }
+  );
+  if (!action) {
+    return;
+  }
+
+  if (action.value === "diff") {
+    for (const file of picked.checkpoint.files) {
+      const uri = resolveWorkspaceUri(file.path);
+      const checkpointContent = file.existed ? file.content ?? "" : "";
+      const virtualUri = makeVirtualUri("checkpoint", file.path, checkpointContent);
+      const exists = await fileExists(uri);
+      const currentUri = exists ? uri : makeVirtualUri("empty", file.path, "");
+      await vscode.commands.executeCommand("vscode.diff", currentUri, virtualUri, `${file.path}: 현재 ↔ 체크포인트`);
+    }
+    return;
+  }
+
+  await restoreCheckpoint(picked.checkpoint);
 }
 
 export function deactivate() {}
@@ -217,34 +466,117 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private async handleMessage(message: { type: string; value?: string; requestId?: string; query?: string }) {
+  private readonly cancelledRequests = new Set<string>();
+  private readonly abortControllers = new Map<string, AbortController>();
+
+  private async handleMessage(message: { type: string; value?: unknown; requestId?: string; query?: string }) {
     switch (message.type) {
       case "chatRequest":
-        await this.handleChatRequest(message as WebviewChatRequestMessage);
+        await this.handleChatRequest(message as unknown as WebviewChatRequestMessage);
+        break;
+      case "chatCancel":
+        if (message.requestId) {
+          this.cancelledRequests.add(message.requestId);
+          this.abortControllers.get(message.requestId)?.abort();
+        }
         break;
       case "listModels":
-        await this.handleListModels(message as WebviewListModelsMessage);
+        await this.handleListModels(message as unknown as WebviewListModelsMessage);
         break;
       case "listWorkspaceEntries":
-        await this.handleListWorkspaceEntries(message as WebviewListWorkspaceEntriesMessage);
+        await this.handleListWorkspaceEntries(message as unknown as WebviewListWorkspaceEntriesMessage);
         break;
+      case "saveSession":
+        await extensionContext?.workspaceState.update(SESSION_STATE_KEY, message.value ?? null);
+        break;
+      case "loadSession": {
+        const session = extensionContext?.workspaceState.get(SESSION_STATE_KEY) ?? null;
+        this.postBridgeMessage({ type: "sessionData", requestId: message.requestId, value: session });
+        break;
+      }
+      case "compactSession":
+        await this.handleCompactSession(message as unknown as WebviewChatRequestMessage);
+        break;
+      case "gitCommit": {
+        const requestId = message.requestId ?? "";
+        try {
+          const result = await gitCommitWithAiMessage();
+          this.postBridgeMessage({ type: "chatChunk", requestId, value: result });
+        } catch (error) {
+          this.postBridgeMessage({ type: "chatChunk", requestId, value: `커밋 실패: ${error instanceof Error ? error.message : String(error)}` });
+        }
+        this.postBridgeMessage({ type: "chatDone", requestId });
+        break;
+      }
+      case "listSkills": {
+        const skills = await loadSkills();
+        this.postBridgeMessage({ type: "skillList", requestId: message.requestId, value: skills });
+        break;
+      }
+      case "clipboardWrite": {
+        if (typeof message.value === "string") {
+          await vscode.env.clipboard.writeText(message.value);
+          vscode.window.setStatusBarMessage("NH-AX-CODE: 클립보드에 복사됨", 2000);
+        }
+        break;
+      }
+      case "saveFile": {
+        const payload = message.value as { name?: string; content?: string } | undefined;
+        if (!payload?.name) {
+          break;
+        }
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        const defaultUri = workspaceFolder
+          ? vscode.Uri.joinPath(workspaceFolder.uri, payload.name)
+          : vscode.Uri.file(payload.name);
+        const target = await vscode.window.showSaveDialog({ defaultUri, saveLabel: "저장" });
+        if (target) {
+          await vscode.workspace.fs.writeFile(target, Buffer.from(payload.content ?? "", "utf8"));
+          vscode.window.setStatusBarMessage(`NH-AX-CODE: ${path.basename(target.fsPath)} 저장됨`, 3000);
+        }
+        break;
+      }
+    }
+  }
+
+  /** /compact: summarize the conversation into one context block via the model. */
+  private async handleCompactSession(message: WebviewChatRequestMessage) {
+    const requestId = message.requestId;
+    try {
+      const settings = normalizeAgentSettings(message.settings);
+      const transcript = (message.messages ?? [])
+        .map((item) => `${item.role === "user" ? "사용자" : "어시스턴트"}: ${item.content}`)
+        .join("\n\n");
+      const result = await callModel([
+        { role: "system", content: "You compress conversations. Summarize the following coding-session transcript into a compact Korean context note that preserves: the task goal, decisions made, files touched, current state, and open items. No preamble." },
+        { role: "user", content: transcript.slice(0, 60000) }
+      ], settings.model, settings.endpointMode, false);
+      this.postBridgeMessage({ type: "sessionCompacted", requestId, value: result.content });
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error);
+      this.postBridgeMessage({ type: "chatError", requestId, value: `컴팩트 실패: ${text}` });
     }
   }
 
   private async handleChatRequest(message: WebviewChatRequestMessage) {
     const requestId = message.requestId;
 
+    const abortController = new AbortController();
+    this.abortControllers.set(requestId, abortController);
+
     try {
       const settings = normalizeAgentSettings(message.settings);
       const mentionContext = await buildMentionContext(message.messages ?? []);
+      const instructions = await loadProjectInstructions();
+      const dynamicContext = await buildDynamicContext();
       const policy = {
         mode: settings.permissionMode,
         scopePaths: mentionContext.scopePaths
       };
-      const chatMessages: ChatMessage[] = [
+      let chatMessages: ChatMessage[] = [
         {
           role: "system",
-          content: buildSystemPrompt(settings, mentionContext)
+          content: [buildSystemPrompt(settings, mentionContext), instructions, dynamicContext].filter(Boolean).join("\n\n")
         },
         ...(message.messages ?? []).map((chatMessage) => ({
           role: chatMessage.role,
@@ -252,13 +584,36 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
         }))
       ];
 
-      for (let step = 0; step < MAX_AGENT_STEPS; step += 1) {
+      // Automatic context compaction before the loop starts.
+      try {
+        chatMessages = await autoCompactMessages(chatMessages, settings.model, settings.endpointMode);
+      } catch {
+        // Compaction is best-effort; a failure must not kill the request.
+      }
+
+      // Closed-loop agent controller (docs/7_AGI/17_AgentLoop.md, Layer F).
+      const controller = new ClosedLoopController();
+      const nativeMode = getProviderConfig().toolMode === "native";
+      for (let step = 0; step < HARD_AGENT_STEP_CAP; step += 1) {
+        if (this.cancelledRequests.has(requestId)) {
+          this.postBridgeMessage({ type: "chatChunk", requestId, value: "\n\n요청이 취소되었습니다." });
+          break;
+        }
+
+        if (nativeMode) {
+          const flow = await this.runNativeToolStep(requestId, chatMessages, settings, policy, controller, step, abortController.signal);
+          if (flow === "break") {
+            break;
+          }
+          continue;
+        }
+
         const streamFilter = createActionBlockStreamFilter((chunk) => {
           this.postBridgeMessage({ type: "chatChunk", requestId, value: chunk });
         });
         const result = await callModel(chatMessages, settings.model, settings.endpointMode, settings.streamResponses, (chunk) => {
           streamFilter.push(chunk);
-        });
+        }, abortController.signal);
         streamFilter.flush();
         this.postModelFallbackIfNeeded(requestId, result);
         this.postUsageIfNeeded(requestId, result.usage);
@@ -271,36 +626,58 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
           }
         }
 
-        const actionResult = await this.applyActionsForAgentStep(requestId, answer, policy, settings.planMode);
-        if (!actionResult) {
+        const observation = await this.applyActionsForAgentStep(requestId, answer, policy, settings.planMode)
+          ?? { hasActions: false, planSignature: "", resultText: "", applyError: false };
+
+        // Verification loop: run the configured verify command after mutations and
+        // feed its outcome into the observation so the critic (F.4) can see it.
+        if (observation.hasActions && !observation.applyError && observation.mutated) {
+          const verifyResult = await runVerifyCommand(requestId, (event) => this.postBridgeMessage(event));
+          if (verifyResult) {
+            observation.resultText = `${observation.resultText}\n\n검증 명령 결과:\n${verifyResult}`;
+          }
+        }
+
+        const decision = controller.step(step, observation);
+        // F.-1.4: surface recursion-quality metrics so the loop is observable.
+        this.postBridgeMessage({
+          type: "loopMetrics",
+          requestId,
+          value: { ...decision.metrics, reason: decision.reason }
+        });
+
+        if (decision.action === "halt") {
+          if (!observation.hasActions) {
+            break; // model produced a final answer — nothing to report.
+          }
+          this.postBridgeMessage({
+            type: "chatChunk",
+            requestId,
+            value: `\n\n루프 종료 (${decision.reason}). 현재 결과를 확인한 뒤 이어서 요청하세요.`
+          });
           break;
         }
 
         chatMessages.push({ role: "assistant", content: answer });
         chatMessages.push({
           role: "user",
-          content: [
-            "작업 결과:",
-            actionResult,
-            "",
-            "Continue the task if more work is required. If the task is complete, provide a final concise summary without a clarus-actions block."
-          ].join("\n")
+          content: ["작업 결과:", observation.resultText, "", decision.directive].join("\n")
         });
-
-        if (step === MAX_AGENT_STEPS - 1) {
-          this.postBridgeMessage({
-            type: "chatChunk",
-            requestId,
-            value: "\n\n작업 단계 한도에 도달했습니다. 현재 결과를 확인한 뒤 이어서 요청하세요."
-          });
-        }
       }
 
       this.postBridgeMessage({ type: "chatDone", requestId });
     } catch (error) {
+      if (this.cancelledRequests.has(requestId)) {
+        this.postBridgeMessage({ type: "chatChunk", requestId, value: "\n\n요청이 취소되었습니다." });
+        this.postBridgeMessage({ type: "chatDone", requestId });
+        return;
+      }
       const text = error instanceof Error ? error.message : String(error);
       this.output.appendLine(`Chat request error: ${text}`);
       this.postBridgeMessage({ type: "chatError", requestId, value: text });
+    } finally {
+      this.abortControllers.delete(requestId);
+      this.cancelledRequests.delete(requestId);
     }
   }
 
@@ -363,29 +740,202 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     this.postBridgeMessage({ type: "chatUsage", requestId, value: usage });
   }
 
-  private async applyActionsForAgentStep(requestId: string, answer: string, policy: FileActionPolicy, planMode: boolean): Promise<string | undefined> {
-    const plan = parseFileActionPlan(answer);
+  /**
+   * One native function-calling round: call the model with tool schemas,
+   * execute returned tool calls, append protocol-correct tool results, and
+   * run the closed-loop controller on the observation.
+   */
+  private async runNativeToolStep(
+    requestId: string,
+    chatMessages: ChatMessage[],
+    settings: Required<WebviewAgentSettings>,
+    policy: FileActionPolicy,
+    controller: ClosedLoopController,
+    step: number,
+    signal: AbortSignal
+  ): Promise<"continue" | "break"> {
+    const result = await callModelWithTools(chatMessages, settings.model, signal);
+    this.postUsageIfNeeded(requestId, result.usage);
+
+    if (result.content) {
+      this.postBridgeMessage({ type: "chatChunk", requestId, value: step === 0 ? result.content : `\n\n${result.content}` });
+    }
+
+    if (!result.toolCalls?.length) {
+      const decision = controller.step(step, { hasActions: false, planSignature: "", resultText: "", applyError: false });
+      this.postBridgeMessage({ type: "loopMetrics", requestId, value: { ...decision.metrics, reason: decision.reason } });
+      return "break";
+    }
+
+    const postToolEvent = (label: string, status: string, detail?: string) => {
+      this.postBridgeMessage({ type: "toolEvent", requestId, value: { label, status, detail } });
+    };
+
+    const operations = result.toolCalls.map(toolCallToOperation);
+    const perCallTexts: string[] = [];
+    let anyMutated = false;
+    let anyApplyError = false;
+
+    for (let index = 0; index < result.toolCalls.length; index += 1) {
+      const call = result.toolCalls[index];
+      const operation = operations[index];
+
+      if (!operation) {
+        perCallTexts.push(`알 수 없는 도구: ${call.name}`);
+        anyApplyError = true;
+        continue;
+      }
+
+      if (settings.planMode && !isReadOnlyOperation(operation)) {
+        perCallTexts.push(`계획 모드: ${call.name} 차단됨 (읽기 도구만 허용)`);
+        postToolEvent(describeOperationLabel(operation), "blocked", "plan mode");
+        continue;
+      }
+
+      const mutating = !isReadOnlyOperation(operation) && operation.type !== "mcpTool";
+      if (mutating) {
+        const preHook = await runHook("preAction", { summary: call.name, operations: operation.type });
+        if (preHook && !preHook.ok) {
+          perCallTexts.push(`preAction 훅이 ${call.name}을 차단했습니다:\n${preHook.output}`);
+          postToolEvent(describeOperationLabel(operation), "blocked", preHook.output);
+          continue;
+        }
+      }
+
+      try {
+        const text = await applyFileActionPlan({ operations: [operation] }, policy, postToolEvent);
+        perCallTexts.push(text);
+        if (mutating) {
+          anyMutated = true;
+          void runHook("postAction", { summary: call.name, result: text.slice(0, 4000) });
+        }
+      } catch (error) {
+        const text = error instanceof Error ? error.message : String(error);
+        perCallTexts.push(`작업 적용 실패: ${text}`);
+        anyApplyError = true;
+        void runHook("onError", { error: text });
+      }
+    }
+
+    // Verification loop feeds the critic in native mode too.
+    if (anyMutated && !anyApplyError) {
+      const verifyResult = await runVerifyCommand(requestId, (event) => this.postBridgeMessage(event));
+      if (verifyResult) {
+        perCallTexts.push(`검증 명령 결과:\n${verifyResult}`);
+      }
+    }
+
+    const combined = perCallTexts.join("\n\n");
+    this.postBridgeMessage({ type: "chatChunk", requestId, value: `\n\n${fenceToolResult(combined)}` });
+
+    // Protocol-correct tool-result feedback.
+    if (getProviderConfig().provider === "anthropic") {
+      chatMessages.push({ role: "assistant", content: result.content, anthropicContent: result.rawAssistant });
+      chatMessages.push({
+        role: "user",
+        content: combined,
+        anthropicContent: result.toolCalls.map((call, index) => ({
+          type: "tool_result",
+          tool_use_id: call.id,
+          content: [{ type: "text", text: perCallTexts[index]?.slice(0, 20000) ?? "" }]
+        }))
+      });
+    } else {
+      chatMessages.push({ role: "assistant", content: result.content, tool_calls: result.toolCalls.map((call) => call.raw) });
+      for (let index = 0; index < result.toolCalls.length; index += 1) {
+        chatMessages.push({ role: "tool", tool_call_id: result.toolCalls[index].id, content: perCallTexts[index]?.slice(0, 20000) ?? "" });
+      }
+    }
+
+    const validOperations = operations.filter((operation): operation is FileOperation => Boolean(operation));
+    const observation: StepObservation = {
+      hasActions: true,
+      planSignature: planSignature(validOperations as unknown as Array<Record<string, unknown>>),
+      resultText: combined,
+      applyError: anyApplyError,
+      mutated: anyMutated
+    };
+    const decision = controller.step(step, observation);
+    this.postBridgeMessage({ type: "loopMetrics", requestId, value: { ...decision.metrics, reason: decision.reason } });
+
+    if (decision.action === "halt") {
+      this.postBridgeMessage({ type: "chatChunk", requestId, value: `\n\n루프 종료 (${decision.reason}).` });
+      return "break";
+    }
+
+    if (decision.directive) {
+      chatMessages.push({ role: "user", content: decision.directive });
+    }
+    return "continue";
+  }
+
+  private async applyActionsForAgentStep(requestId: string, answer: string, policy: FileActionPolicy, planMode: boolean): Promise<StepObservation | undefined> {
+    let plan = parseFileActionPlan(answer);
     if (!plan) {
       return undefined;
     }
 
+    // Real plan mode: read-only tools stay available; mutations are blocked.
     if (planMode) {
-      const message = "계획 모드가 켜져 있어 작업을 적용하지 않았습니다.";
-      this.postBridgeMessage({ type: "chatChunk", requestId, value: `\n\n${message}` });
-      return undefined;
+      const readOnly = plan.operations.filter(isReadOnlyOperation);
+      const blocked = plan.operations.length - readOnly.length;
+      if (!readOnly.length) {
+        const message = "계획 모드: 수정 작업은 차단되었습니다. readFile/listDir/searchText로 조사하거나 계획을 제시하세요.";
+        this.postBridgeMessage({ type: "chatChunk", requestId, value: `\n\n${message}` });
+        return blocked
+          ? { hasActions: true, planSignature: planSignature(plan.operations as unknown as Array<Record<string, unknown>>), resultText: message, applyError: false, mutated: false }
+          : undefined;
+      }
+      plan = { summary: plan.summary, operations: readOnly };
+      if (blocked > 0) {
+        this.postBridgeMessage({ type: "chatChunk", requestId, value: `\n\n계획 모드: 수정 작업 ${blocked}건은 차단하고 읽기 작업만 실행합니다.` });
+      }
     }
 
-    const shouldApply = true;
-
-    if (!shouldApply) {
-      const message = "작업을 적용하지 않았습니다.";
-      this.postBridgeMessage({ type: "chatChunk", requestId, value: `\n\n${message}` });
-      return undefined;
+    // Partial accept: when auto-apply is off, let the user pick operations (with diff preview).
+    if (!planMode && !getProviderConfig().autoApplyFileActions) {
+      const selected = await selectOperationsForApproval(plan);
+      if (!selected) {
+        const message = "사용자가 작업 적용을 거부했습니다.";
+        this.postBridgeMessage({ type: "chatChunk", requestId, value: `\n\n${message}` });
+        return { hasActions: true, planSignature: planSignature(plan.operations as unknown as Array<Record<string, unknown>>), resultText: message, applyError: false, mutated: false };
+      }
+      plan = selected;
     }
 
-    const result = await applyFileActionPlan(plan, policy);
-    this.postBridgeMessage({ type: "chatChunk", requestId, value: `\n\n${result}` });
-    return result;
+    const signature = planSignature(plan.operations as unknown as Array<Record<string, unknown>>);
+    const mutated = plan.operations.some((operation) => !isReadOnlyOperation(operation));
+    const postToolEvent = (label: string, status: string, detail?: string) => {
+      this.postBridgeMessage({ type: "toolEvent", requestId, value: { label, status, detail } });
+    };
+
+    // preAction hook: a non-zero exit blocks the plan.
+    if (mutated) {
+      const preHook = await runHook("preAction", { summary: plan.summary ?? "", operations: JSON.stringify(plan.operations.map((operation) => operation.type)) });
+      if (preHook && !preHook.ok) {
+        const result = `preAction 훅이 작업을 차단했습니다:\n${preHook.output}`;
+        this.postBridgeMessage({ type: "chatChunk", requestId, value: `\n\n${result}` });
+        postToolEvent("hook:preAction", "blocked", preHook.output);
+        return { hasActions: true, planSignature: signature, resultText: result, applyError: false, mutated: false };
+      }
+    }
+
+    // Capture thrown apply errors so the closed loop can self-correct (F.4 c_pred)
+    // instead of the whole turn dying on the first bad operation.
+    try {
+      const result = await applyFileActionPlan(plan, policy, postToolEvent);
+      this.postBridgeMessage({ type: "chatChunk", requestId, value: `\n\n${fenceToolResult(result)}` });
+      if (mutated) {
+        void runHook("postAction", { summary: plan.summary ?? "", result: result.slice(0, 4000) });
+      }
+      return { hasActions: true, planSignature: signature, resultText: result, applyError: false, mutated };
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error);
+      const result = `작업 적용 실패: ${text}`;
+      this.postBridgeMessage({ type: "chatChunk", requestId, value: `\n\n${fenceToolResult(result)}` });
+      void runHook("onError", { error: text });
+      return { hasActions: true, planSignature: signature, resultText: result, applyError: true, mutated };
+    }
   }
 
   private async offerFileActions(requestId: string, answer: string, policy: FileActionPolicy, planMode: boolean) {
@@ -480,7 +1030,8 @@ async function callModel(
   modelOverride?: string,
   endpointModeOverride?: OpenAIEndpointMode,
   streamResponsesOverride?: boolean,
-  onChunk?: (chunk: string) => void
+  onChunk?: (chunk: string) => void,
+  signal?: AbortSignal
 ): Promise<ModelCallResult> {
   const config = getProviderConfig();
   config.endpointMode = endpointModeOverride ?? config.endpointMode;
@@ -493,19 +1044,19 @@ async function callModel(
   if (config.provider === "anthropic") {
     const requestedModel = modelOverride || config.model;
     return {
-      content: await callAnthropic(config, messages, requestedModel),
+      content: await callAnthropic(config, messages, requestedModel, signal),
       requestedModel,
       usedModel: requestedModel
     };
   }
 
-  return callOpenAICompatible(config, messages, modelOverride, onChunk);
+  return callOpenAICompatible(config, messages, modelOverride, onChunk, signal);
 }
 
-async function callOpenAICompatible(config: ProviderConfig, messages: ChatMessage[], modelOverride?: string, onChunk?: (chunk: string) => void): Promise<ModelCallResult> {
+async function callOpenAICompatible(config: ProviderConfig, messages: ChatMessage[], modelOverride?: string, onChunk?: (chunk: string) => void, signal?: AbortSignal): Promise<ModelCallResult> {
   const baseUrl = config.provider === "openai" ? "https://api.openai.com/v1" : config.compatibleBaseUrl.replace(/\/$/, "");
   const model = modelOverride || config.model;
-  return callOpenAIEndpointRouter(baseUrl, config, messages, model, onChunk);
+  return callOpenAIEndpointRouter(baseUrl, config, messages, model, onChunk, signal);
   if (!isChatCompletionModel(model, config.provider)) {
     const completion = await requestTextCompletion(baseUrl, config, messages, model);
     if (completion.ok) {
@@ -579,22 +1130,63 @@ async function requestTextCompletion(baseUrl: string, config: ProviderConfig, me
   });
 }
 
+type EndpointName = Exclude<OpenAIEndpointMode, "auto">;
+
+interface ModelEndpointCapability {
+  ok?: EndpointName;
+  failed: EndpointName[];
+}
+
+function getEndpointCache(): Record<string, ModelEndpointCapability> {
+  return extensionContext?.globalState.get<Record<string, ModelEndpointCapability>>(ENDPOINT_CACHE_STATE_KEY, {}) ?? {};
+}
+
+async function updateEndpointCache(model: string, mutate: (entry: ModelEndpointCapability) => void): Promise<void> {
+  if (!extensionContext) {
+    return;
+  }
+  const cache = getEndpointCache();
+  const entry = cache[model] ?? { failed: [] };
+  mutate(entry);
+  cache[model] = entry;
+  await extensionContext.globalState.update(ENDPOINT_CACHE_STATE_KEY, cache);
+}
+
+/** Per-model capability cache + failed-endpoint blacklist applied to the try order. */
+function orderEndpointsWithCache(model: string, endpoints: EndpointName[]): EndpointName[] {
+  const entry = getEndpointCache()[model];
+  if (!entry) {
+    return endpoints;
+  }
+  const usable = endpoints.filter((endpoint) => !entry.failed.includes(endpoint));
+  const pool = usable.length ? usable : endpoints; // never blacklist everything
+  if (entry.ok && pool.includes(entry.ok)) {
+    return [entry.ok, ...pool.filter((endpoint) => endpoint !== entry.ok)];
+  }
+  return pool;
+}
+
 async function callOpenAIEndpointRouter(
   baseUrl: string,
   config: ProviderConfig,
   messages: ChatMessage[],
   model: string,
-  onChunk?: (chunk: string) => void
+  onChunk?: (chunk: string) => void,
+  signal?: AbortSignal
 ): Promise<ModelCallResult> {
   const errors: string[] = [];
-  const endpoints = getOpenAIEndpointOrder(config.endpointMode);
+  const endpoints = orderEndpointsWithCache(model, getOpenAIEndpointOrder(config.endpointMode));
 
   for (const endpoint of endpoints) {
-    const response = await requestOpenAIEndpoint(baseUrl, config, messages, model, endpoint, config.streamResponses);
+    const response = await requestOpenAIEndpoint(baseUrl, config, messages, model, endpoint, config.streamResponses, signal);
     if (response.ok) {
       const contentType = response.headers.get("content-type") ?? "";
       const isSse = contentType.includes("text/event-stream");
       const parsed = await readOpenAIEndpointResponseWithUsage(response, endpoint, onChunk);
+      void updateEndpointCache(model, (entry) => {
+        entry.ok = endpoint;
+        entry.failed = entry.failed.filter((item) => item !== endpoint);
+      });
       return {
         content: parsed.content,
         requestedModel: model,
@@ -606,6 +1198,17 @@ async function callOpenAIEndpointRouter(
 
     const text = await response.text();
     errors.push(`${endpoint}: ${response.status} ${text}`);
+    if (isEndpointFallbackError(response.status, text)) {
+      // Structural mismatch (wrong endpoint for this model) — blacklist it.
+      void updateEndpointCache(model, (entry) => {
+        if (!entry.failed.includes(endpoint)) {
+          entry.failed.push(endpoint);
+        }
+        if (entry.ok === endpoint) {
+          entry.ok = undefined;
+        }
+      });
+    }
     if (config.endpointMode !== "auto" && !isEndpointFallbackError(response.status, text)) {
       break;
     }
@@ -625,7 +1228,8 @@ async function requestOpenAIEndpoint(
   messages: ChatMessage[],
   model: string,
   endpoint: Exclude<OpenAIEndpointMode, "auto">,
-  stream: boolean
+  stream: boolean,
+  signal?: AbortSignal
 ): Promise<Response> {
   const pathByEndpoint: Record<Exclude<OpenAIEndpointMode, "auto">, string> = {
     "chat-completions": "chat/completions",
@@ -635,6 +1239,7 @@ async function requestOpenAIEndpoint(
 
   return fetch(`${baseUrl}/${pathByEndpoint[endpoint]}`, {
     method: "POST",
+    signal,
     headers: {
       "Content-Type": "application/json",
       ...config.requestHeaders,
@@ -642,6 +1247,51 @@ async function requestOpenAIEndpoint(
     },
     body: JSON.stringify(buildOpenAIEndpointBody(endpoint, messages, model, stream))
   });
+}
+
+/** Probe each endpoint with a tiny prompt and report a diagnostics table. */
+async function probeEndpoints(output: vscode.OutputChannel): Promise<void> {
+  const config = getProviderConfig();
+  if (config.provider === "anthropic") {
+    void vscode.window.showInformationMessage("Anthropic 제공자는 단일 messages 엔드포인트를 사용합니다. 진단이 필요 없습니다.");
+    return;
+  }
+
+  const baseUrl = config.provider === "openai" ? "https://api.openai.com/v1" : config.compatibleBaseUrl.replace(/\/$/, "");
+  const model = config.model;
+  const probeMessages: ChatMessage[] = [{ role: "user", content: "ping" }];
+  const lines: string[] = [`엔드포인트 진단 — model=${model}, baseUrl=${baseUrl}`];
+
+  for (const endpoint of ["chat-completions", "responses", "completions"] as const) {
+    const started = Date.now();
+    try {
+      const response = await requestOpenAIEndpoint(baseUrl, config, probeMessages, model, endpoint, false);
+      lines.push(`${endpoint}: ${response.ok ? "OK" : `실패 ${response.status}`} (${Date.now() - started}ms)`);
+      if (response.ok) {
+        await updateEndpointCache(model, (entry) => {
+          entry.ok = entry.ok ?? endpoint;
+          entry.failed = entry.failed.filter((item) => item !== endpoint);
+        });
+      } else {
+        const text = await response.text();
+        if (isEndpointFallbackError(response.status, text)) {
+          await updateEndpointCache(model, (entry) => {
+            if (!entry.failed.includes(endpoint)) {
+              entry.failed.push(endpoint);
+            }
+          });
+        }
+      }
+    } catch (error) {
+      lines.push(`${endpoint}: 오류 ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  const cacheEntry = getEndpointCache()[model];
+  lines.push(`캐시: ok=${cacheEntry?.ok ?? "-"}, blacklist=[${cacheEntry?.failed.join(", ") ?? ""}]`);
+  output.appendLine(lines.join("\n"));
+  output.show(true);
+  void vscode.window.showInformationMessage(lines.join(" · "));
 }
 
 function buildOpenAIEndpointBody(endpoint: Exclude<OpenAIEndpointMode, "auto">, messages: ChatMessage[], model: string, stream: boolean): Record<string, unknown> {
@@ -993,7 +1643,7 @@ async function retryChatCompletionWithFallbackModels(
   return undefined;
 }
 
-async function callAnthropic(config: ProviderConfig, messages: ChatMessage[], modelOverride?: string): Promise<string> {
+async function callAnthropic(config: ProviderConfig, messages: ChatMessage[], modelOverride?: string, signal?: AbortSignal): Promise<string> {
   const system = messages.find((message) => message.role === "system")?.content ?? SYSTEM_PROMPT;
   const chatMessages = messages
     .filter((message) => message.role !== "system")
@@ -1001,6 +1651,7 @@ async function callAnthropic(config: ProviderConfig, messages: ChatMessage[], mo
 
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
+    signal,
     headers: {
       "Content-Type": "application/json",
       ...config.requestHeaders,
@@ -1023,6 +1674,184 @@ async function callAnthropic(config: ProviderConfig, messages: ChatMessage[], mo
   return data.content?.find((item) => item.type === "text")?.text?.trim() || "응답 내용이 없습니다.";
 }
 
+// ---------------------------------------------------------------------------
+// Native function-calling (toolMode: "native")
+// ---------------------------------------------------------------------------
+
+interface NativeToolSchema {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+}
+
+function buildNativeToolSchemas(): NativeToolSchema[] {
+  const stringProp = { type: "string" };
+  const base: NativeToolSchema[] = [
+    { name: "create_file", description: "Create a new file with content.", parameters: { type: "object", properties: { path: stringProp, content: stringProp }, required: ["path", "content"] } },
+    { name: "replace_file", description: "Replace an entire file's content.", parameters: { type: "object", properties: { path: stringProp, content: stringProp }, required: ["path", "content"] } },
+    { name: "replace_range", description: "Replace a zero-based position range in a file.", parameters: { type: "object", properties: { path: stringProp, startLine: { type: "number" }, startCharacter: { type: "number" }, endLine: { type: "number" }, endCharacter: { type: "number" }, content: stringProp }, required: ["path", "startLine", "startCharacter", "endLine", "endCharacter", "content"] } },
+    { name: "delete_file", description: "Delete a file.", parameters: { type: "object", properties: { path: stringProp }, required: ["path"] } },
+    { name: "run_command", description: "Run a shell command in the workspace.", parameters: { type: "object", properties: { command: stringProp, args: { type: "array", items: stringProp }, cwd: stringProp }, required: ["command"] } },
+    { name: "read_file", description: "Read a file (optionally a line range).", parameters: { type: "object", properties: { path: stringProp, startLine: { type: "number" }, endLine: { type: "number" } }, required: ["path"] } },
+    { name: "list_dir", description: "List a directory.", parameters: { type: "object", properties: { path: stringProp }, required: ["path"] } },
+    { name: "search_text", description: "Regex search across the workspace.", parameters: { type: "object", properties: { pattern: stringProp, path: stringProp, maxResults: { type: "number" } }, required: ["pattern"] } },
+    { name: "subagent", description: "Spawn a read-only research subagent; returns its findings.", parameters: { type: "object", properties: { task: stringProp, context: stringProp }, required: ["task"] } }
+  ];
+
+  const mcp = (mcpManager?.allTools() ?? []).map((tool) => ({
+    name: `mcp__${tool.server}__${tool.name}`,
+    description: tool.description.slice(0, 500) || `MCP tool ${tool.name} on ${tool.server}`,
+    parameters: tool.inputSchema ?? { type: "object", properties: {} }
+  }));
+
+  return [...base, ...mcp];
+}
+
+function toolCallToOperation(call: NativeToolCall): FileOperation | undefined {
+  const args = call.arguments as Record<string, unknown>;
+  const str = (key: string) => String(args[key] ?? "");
+  const num = (key: string) => Number(args[key] ?? 0);
+
+  switch (call.name) {
+    case "create_file":
+      return { type: "create", path: str("path"), content: str("content") };
+    case "replace_file":
+      return { type: "replace", path: str("path"), content: str("content") };
+    case "replace_range":
+      return { type: "replaceRange", path: str("path"), startLine: num("startLine"), startCharacter: num("startCharacter"), endLine: num("endLine"), endCharacter: num("endCharacter"), content: str("content") };
+    case "delete_file":
+      return { type: "delete", path: str("path") };
+    case "run_command":
+      return { type: "runCommand", command: str("command"), args: Array.isArray(args.args) ? args.args.map(String) : undefined, cwd: args.cwd ? str("cwd") : undefined };
+    case "read_file":
+      return { type: "readFile", path: str("path"), startLine: args.startLine ? num("startLine") : undefined, endLine: args.endLine ? num("endLine") : undefined };
+    case "list_dir":
+      return { type: "listDir", path: str("path") };
+    case "search_text":
+      return { type: "searchText", pattern: str("pattern"), path: args.path ? str("path") : undefined, maxResults: args.maxResults ? num("maxResults") : undefined };
+    case "subagent":
+      return { type: "subagent", task: str("task"), context: args.context ? str("context") : undefined };
+    default: {
+      if (call.name.startsWith("mcp__")) {
+        const [, server, ...rest] = call.name.split("__");
+        if (server && rest.length) {
+          return { type: "mcpTool", server, tool: rest.join("__"), arguments: args };
+        }
+      }
+      return undefined;
+    }
+  }
+}
+
+/**
+ * Model call with native tool schemas. OpenAI/compatible uses chat-completions
+ * function calling; Anthropic uses tool_use blocks. Streaming is disabled.
+ */
+async function callModelWithTools(messages: ChatMessage[], modelOverride?: string, signal?: AbortSignal): Promise<ModelCallResult> {
+  const config = getProviderConfig();
+  const tools = buildNativeToolSchemas();
+  const model = modelOverride || config.model;
+
+  if (config.provider === "anthropic") {
+    const system = messages.find((message) => message.role === "system")?.content;
+    const anthropicMessages = messages
+      .filter((message) => message.role !== "system")
+      .map((message) => ({
+        role: message.role === "tool" ? "user" : message.role,
+        content: message.anthropicContent ?? message.content
+      }));
+
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      signal,
+      headers: {
+        "Content-Type": "application/json",
+        ...config.requestHeaders,
+        "x-api-key": config.apiKey,
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model,
+        system,
+        messages: anthropicMessages,
+        max_tokens: 8192,
+        tools: tools.map((tool) => ({ name: tool.name, description: tool.description, input_schema: tool.parameters }))
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`Anthropic 요청 실패: ${response.status} ${await response.text()}`);
+    }
+
+    const data = await response.json() as { content?: Array<{ type: string; text?: string; id?: string; name?: string; input?: Record<string, unknown> }>; usage?: { input_tokens?: number; output_tokens?: number } };
+    const blocks = data.content ?? [];
+    const content = blocks.filter((block) => block.type === "text").map((block) => block.text ?? "").join("").trim();
+    const toolCalls: NativeToolCall[] = blocks
+      .filter((block) => block.type === "tool_use")
+      .map((block) => ({ id: block.id ?? "", name: block.name ?? "", arguments: block.input ?? {}, raw: block }));
+
+    return {
+      content,
+      requestedModel: model,
+      usedModel: model,
+      toolCalls: toolCalls.length ? toolCalls : undefined,
+      rawAssistant: blocks,
+      usage: data.usage ? { input: data.usage.input_tokens, output: data.usage.output_tokens } : undefined
+    };
+  }
+
+  // OpenAI / OpenAI-compatible: chat-completions function calling.
+  const baseUrl = config.provider === "openai" ? "https://api.openai.com/v1" : config.compatibleBaseUrl.replace(/\/$/, "");
+  const response = await fetch(`${baseUrl}/chat/completions`, {
+    method: "POST",
+    signal,
+    headers: {
+      "Content-Type": "application/json",
+      ...config.requestHeaders,
+      ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {})
+    },
+    body: JSON.stringify({
+      model,
+      stream: false,
+      messages: messages.map((message) => ({
+        role: message.role,
+        content: message.content,
+        ...(message.tool_calls ? { tool_calls: message.tool_calls } : {}),
+        ...(message.tool_call_id ? { tool_call_id: message.tool_call_id } : {})
+      })),
+      tools: tools.map((tool) => ({ type: "function", function: tool }))
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`제공자 요청 실패 (native tools): ${response.status} ${await response.text()}`);
+  }
+
+  const data = await response.json() as {
+    choices?: Array<{ message?: { content?: string | null; tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }> } }>;
+    usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+  };
+  const assistantMessage = data.choices?.[0]?.message;
+  const toolCalls: NativeToolCall[] = (assistantMessage?.tool_calls ?? []).map((call) => {
+    let parsedArgs: Record<string, unknown> = {};
+    try {
+      parsedArgs = JSON.parse(call.function?.arguments || "{}");
+    } catch {
+      parsedArgs = { _raw: call.function?.arguments };
+    }
+    return { id: call.id ?? "", name: call.function?.name ?? "", arguments: parsedArgs, raw: call };
+  });
+
+  return {
+    content: (assistantMessage?.content ?? "").toString().trim(),
+    requestedModel: model,
+    usedModel: model,
+    toolCalls: toolCalls.length ? toolCalls : undefined,
+    rawAssistant: assistantMessage,
+    usage: data.usage ? { input: data.usage.prompt_tokens, output: data.usage.completion_tokens, total: data.usage.total_tokens } : undefined
+  };
+}
+
 function getProviderConfig(): ProviderConfig {
   const config = vscode.workspace.getConfiguration("clarusCode");
   return {
@@ -1033,7 +1862,8 @@ function getProviderConfig(): ProviderConfig {
     requestHeaders: config.get<Record<string, string>>("requestHeaders", {}),
     autoApplyFileActions: config.get<boolean>("autoApplyFileActions", true),
     endpointMode: config.get<OpenAIEndpointMode>("endpointMode", "auto"),
-    streamResponses: config.get<boolean>("streamResponses", true)
+    streamResponses: config.get<boolean>("streamResponses", true),
+    toolMode: config.get<"actions-block" | "native">("toolMode", "actions-block")
   };
 }
 
@@ -1499,6 +2329,13 @@ function summarizePlan(plan: FileActionPlan): string {
         return `Delete ${operation.path}`;
       case "runCommand":
         return `Run ${formatCommandForDisplay(operation)}`;
+      case "readFile":
+      case "listDir":
+      case "searchText":
+      case "subagent":
+        return describeReadOnlyOperation(operation);
+      case "mcpTool":
+        return `MCP ${operation.server}/${operation.tool}`;
     }
   });
 
@@ -1547,6 +2384,16 @@ function buildPlanPreviewMarkdown(plan: FileActionPlan, summary: string): string
       return;
     }
 
+    if (isReadOnlyOperation(operation)) {
+      sections.push(`읽기: \`${describeReadOnlyOperation(operation)}\``, "");
+      return;
+    }
+
+    if (operation.type === "mcpTool") {
+      sections.push(`MCP: \`${operation.server}/${operation.tool}\``, "");
+      return;
+    }
+
     sections.push(
       `명령: \`${formatCommandForDisplay(operation)}\``,
       `작업 폴더: \`${operation.cwd ?? "."}\``,
@@ -1586,6 +2433,13 @@ function buildActionPreviewOperations(plan: FileActionPlan): unknown[] {
       };
     }
 
+    if (isReadOnlyOperation(operation) || operation.type === "mcpTool") {
+      return {
+        type: operation.type,
+        label: describeOperation(operation)
+      };
+    }
+
     return {
       type: operation.type,
       label: describeOperation(operation),
@@ -1607,6 +2461,13 @@ function describeOperation(operation: FileOperation): string {
       return `삭제 ${operation.path}`;
     case "runCommand":
       return `실행 ${formatCommandForDisplay(operation)}`;
+    case "readFile":
+    case "listDir":
+    case "searchText":
+    case "subagent":
+      return `읽기 ${describeReadOnlyOperation(operation)}`;
+    case "mcpTool":
+      return `MCP ${operation.server}/${operation.tool}`;
   }
 }
 
@@ -1623,9 +2484,23 @@ function codeFence(content: string): string {
   return ["```", content.replace(/```/g, "'''"), "```"].join("\n");
 }
 
-async function applyFileActionPlan(plan: FileActionPlan, policy: FileActionPolicy): Promise<string> {
+/**
+ * Wrap raw tool output in a markdown code fence so the webview renderer keeps
+ * line breaks and monospacing. The fence is grown past any backtick run inside
+ * the content (readFile results contain ``` fences of their own).
+ */
+function fenceToolResult(text: string): string {
+  const longestBacktickRun = text.match(/`+/g)?.reduce((max, run) => Math.max(max, run.length), 0) ?? 0;
+  const fence = "`".repeat(Math.max(4, longestBacktickRun + 1));
+  return `${fence}text\n${text}\n${fence}`;
+}
+
+type ToolEventPoster = (label: string, status: string, detail?: string) => void;
+
+async function applyFileActionPlan(plan: FileActionPlan, policy: FileActionPolicy, postToolEvent?: ToolEventPoster): Promise<string> {
   const touched: string[] = [];
   const commands: Extract<FileOperation, { type: "runCommand" }>[] = [];
+  const readResults: string[] = [];
   const checkpoint = await createCheckpoint(plan);
 
   for (const operation of plan.operations) {
@@ -1634,9 +2509,42 @@ async function applyFileActionPlan(plan: FileActionPlan, policy: FileActionPolic
       continue;
     }
 
+    if (operation.type === "mcpTool") {
+      const label = `mcp:${operation.server}/${operation.tool}`;
+      postToolEvent?.(label, "running");
+      try {
+        if (!mcpManager) {
+          throw new Error("MCP 매니저가 초기화되지 않았습니다.");
+        }
+        const text = await mcpManager.callTool(operation.server, operation.tool, operation.arguments ?? {});
+        readResults.push(`${label} 결과:\n${text.slice(0, 24000)}`);
+        postToolEvent?.(label, "done");
+      } catch (error) {
+        const text = error instanceof Error ? error.message : String(error);
+        readResults.push(`${label} 실패: ${text}`);
+        postToolEvent?.(label, "error", text);
+      }
+      continue;
+    }
+
+    if (isReadOnlyOperation(operation)) {
+      const label = describeReadOnlyOperation(operation);
+      postToolEvent?.(label, "running");
+      try {
+        readResults.push(await runReadOnlyOperation(operation));
+        postToolEvent?.(label, "done");
+      } catch (error) {
+        const text = error instanceof Error ? error.message : String(error);
+        readResults.push(`${label} 실패: ${text}`);
+        postToolEvent?.(label, "error", text);
+      }
+      continue;
+    }
+
     assertFileActionAllowed(operation.path, policy);
     const uri = resolveWorkspaceUri(operation.path);
     touched.push(`${operation.type} ${operation.path}`);
+    postToolEvent?.(`${operation.type} ${operation.path}`, "done");
 
     switch (operation.type) {
       case "create":
@@ -1675,7 +2583,17 @@ async function applyFileActionPlan(plan: FileActionPlan, policy: FileActionPolic
 
   const commandResults: string[] = [];
   for (const command of commands) {
-    commandResults.push(await runApprovedCommand(command));
+    const label = formatCommandForDisplay(command);
+    const ruling = evaluateCommandRules(label);
+    if (ruling.blocked) {
+      commandResults.push(`$ ${label}\n차단되었습니다: ${ruling.reason}`);
+      postToolEvent?.(`$ ${label}`, "blocked", ruling.reason);
+      continue;
+    }
+    postToolEvent?.(`$ ${label}`, "running");
+    const result = await runApprovedCommand(command, (chunk) => postToolEvent?.(`$ ${label}`, "output", chunk));
+    postToolEvent?.(`$ ${label}`, /\nexit 0 /.test(`\n${result}`) ? "done" : "error");
+    commandResults.push(result);
   }
 
   const sections = [];
@@ -1685,6 +2603,9 @@ async function applyFileActionPlan(plan: FileActionPlan, policy: FileActionPolic
   if (touched.length) {
     sections.push(`적용된 파일 작업:\n${touched.map((item) => `- ${item}`).join("\n")}`);
   }
+  if (readResults.length) {
+    sections.push(`읽기 도구 결과:\n${readResults.join("\n\n")}`);
+  }
   if (commandResults.length) {
     sections.push(`명령 실행 결과:\n${commandResults.join("\n\n")}`);
   }
@@ -1692,9 +2613,385 @@ async function applyFileActionPlan(plan: FileActionPlan, policy: FileActionPolic
   return sections.join("\n\n") || "적용된 파일 작업이 없습니다.";
 }
 
+function describeReadOnlyOperation(operation: ReadOnlyOperation): string {
+  if (operation.type === "readFile") {
+    return `readFile ${operation.path}`;
+  }
+  if (operation.type === "listDir") {
+    return `listDir ${operation.path}`;
+  }
+  if (operation.type === "subagent") {
+    return `subagent "${operation.task.slice(0, 80)}"`;
+  }
+  return `searchText /${operation.pattern}/${operation.path ? ` in ${operation.path}` : ""}`;
+}
+
+async function runReadOnlyOperation(operation: ReadOnlyOperation): Promise<string> {
+  if (operation.type === "subagent") {
+    const findings = await runSubagent(operation.task, operation.context);
+    return `subagent 결과 (task: ${operation.task.slice(0, 120)}):\n${findings.slice(0, 24000)}`;
+  }
+
+  if (operation.type === "readFile") {
+    const uri = resolveWorkspaceUri(operation.path);
+    const text = await readWorkspaceTextFile(uri, 200000);
+    const lines = text.split(/\r?\n/);
+    const start = Math.max(0, (operation.startLine ?? 1) - 1);
+    const end = Math.min(lines.length, operation.endLine ?? Math.min(lines.length, start + 400));
+    const slice = lines.slice(start, end).map((line, index) => `${start + index + 1}\t${line}`).join("\n");
+    return [`readFile ${operation.path} (${start + 1}-${end}/${lines.length}줄)`, "```", slice.slice(0, 24000), "```"].join("\n");
+  }
+
+  if (operation.type === "listDir") {
+    const uri = resolveWorkspaceUri(operation.path || ".");
+    const entries = await vscode.workspace.fs.readDirectory(uri);
+    const listing = entries
+      .sort((a, b) => (a[1] === b[1] ? a[0].localeCompare(b[0]) : a[1] === vscode.FileType.Directory ? -1 : 1))
+      .map(([name, type]) => `${type === vscode.FileType.Directory ? "dir " : "file"} ${name}`)
+      .slice(0, 300)
+      .join("\n");
+    return `listDir ${operation.path}\n${listing || "(비어 있음)"}`;
+  }
+
+  // searchText: bounded workspace grep.
+  const pattern = new RegExp(operation.pattern, "i");
+  const maxResults = Math.min(Math.max(operation.maxResults ?? 40, 1), 200);
+  const include = operation.path ? `${normalizeRelativePath(operation.path)}/**/*` : "**/*";
+  const files = await vscode.workspace.findFiles(include, "{**/node_modules/**,**/dist/**,**/.git/**}", 800);
+  const hits: string[] = [];
+  for (const file of files) {
+    if (hits.length >= maxResults) {
+      break;
+    }
+    let text: string;
+    try {
+      text = await readWorkspaceTextFile(file, 300000);
+    } catch {
+      continue;
+    }
+    const lines = text.split(/\r?\n/);
+    for (let index = 0; index < lines.length && hits.length < maxResults; index += 1) {
+      if (pattern.test(lines[index])) {
+        hits.push(`${vscode.workspace.asRelativePath(file, false)}:${index + 1}: ${lines[index].trim().slice(0, 200)}`);
+      }
+    }
+  }
+  return `searchText /${operation.pattern}/ → ${hits.length}건\n${hits.join("\n") || "(일치 없음)"}`;
+}
+
+function evaluateCommandRules(commandLabel: string): { blocked: boolean; reason: string } {
+  const config = vscode.workspace.getConfiguration("clarusCode");
+  const denylist = config.get<string[]>("commandDenylist", []);
+  const allowlist = config.get<string[]>("commandAllowlist", []);
+  const normalized = commandLabel.trim().toLowerCase();
+
+  const denied = denylist.find((rule) => rule.trim() && normalized.startsWith(rule.trim().toLowerCase()));
+  if (denied) {
+    return { blocked: true, reason: `denylist 규칙 '${denied}'` };
+  }
+
+  if (allowlist.length && !allowlist.some((rule) => rule.trim() && normalized.startsWith(rule.trim().toLowerCase()))) {
+    return { blocked: true, reason: "allowlist에 없는 명령" };
+  }
+
+  return { blocked: false, reason: "" };
+}
+
+/** Partial accept: per-operation selection with on-demand diff preview. */
+async function selectOperationsForApproval(plan: FileActionPlan): Promise<FileActionPlan | undefined> {
+  interface OperationItem extends vscode.QuickPickItem {
+    operation: FileOperation;
+  }
+
+  const items: OperationItem[] = plan.operations.map((operation) => ({
+    label: operation.type === "runCommand" ? `$ ${formatCommandForDisplay(operation)}` : describeOperationLabel(operation),
+    picked: true,
+    operation,
+    buttons: hasDiffPreview(operation) ? [{ iconPath: new vscode.ThemeIcon("diff"), tooltip: "diff 미리보기" }] : []
+  }));
+
+  const quickPick = vscode.window.createQuickPick<OperationItem>();
+  quickPick.title = plan.summary || "제안된 작업";
+  quickPick.placeholder = "적용할 작업을 선택하세요 (diff 버튼으로 미리보기)";
+  quickPick.canSelectMany = true;
+  quickPick.items = items;
+  quickPick.selectedItems = items;
+
+  quickPick.onDidTriggerItemButton(async (event) => {
+    await showOperationDiff(event.item.operation);
+  });
+
+  const selection = await new Promise<readonly OperationItem[] | undefined>((resolve) => {
+    quickPick.onDidAccept(() => resolve(quickPick.selectedItems));
+    quickPick.onDidHide(() => resolve(undefined));
+    quickPick.show();
+  });
+  quickPick.dispose();
+
+  if (!selection || !selection.length) {
+    return undefined;
+  }
+
+  return { summary: plan.summary, operations: selection.map((item) => item.operation) };
+}
+
+function describeOperationLabel(operation: FileOperation): string {
+  if (isReadOnlyOperation(operation)) {
+    return describeReadOnlyOperation(operation);
+  }
+  if (operation.type === "runCommand") {
+    return `$ ${formatCommandForDisplay(operation)}`;
+  }
+  if (operation.type === "mcpTool") {
+    return `mcp:${operation.server}/${operation.tool}`;
+  }
+  return `${operation.type} ${operation.path}`;
+}
+
+function hasDiffPreview(operation: FileOperation): boolean {
+  return operation.type === "create" || operation.type === "replace" || operation.type === "replaceRange" || operation.type === "delete";
+}
+
+async function showOperationDiff(operation: FileOperation): Promise<void> {
+  if (operation.type !== "create" && operation.type !== "replace" && operation.type !== "replaceRange" && operation.type !== "delete") {
+    return;
+  }
+
+  const uri = resolveWorkspaceUri(operation.path);
+  const exists = await fileExists(uri);
+  const current = exists ? await readWorkspaceTextFile(uri, Number.MAX_SAFE_INTEGER) : "";
+
+  let proposed = "";
+  if (operation.type === "create" || operation.type === "replace") {
+    proposed = operation.content;
+  } else if (operation.type === "replaceRange") {
+    proposed = replaceTextRange(current, operation);
+  } // delete → proposed stays ""
+
+  const leftUri = exists ? uri : makeVirtualUri("empty", operation.path, "");
+  const rightUri = makeVirtualUri("proposed", operation.path, proposed);
+  await vscode.commands.executeCommand("vscode.diff", leftUri, rightUri, `${operation.path}: 현재 ↔ 제안`);
+}
+
+/** Load AGENTS.md / CLAUDE.md / NH-AX-CODE.md instructions from the workspace root. */
+async function loadProjectInstructions(): Promise<string> {
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  if (!workspaceFolder) {
+    return "";
+  }
+
+  const chunks: string[] = [];
+  let remaining = 16000;
+  for (const name of ["NH-AX-CODE.md", "AGENTS.md", "CLAUDE.md"]) {
+    if (remaining <= 0) {
+      break;
+    }
+    try {
+      const uri = vscode.Uri.joinPath(workspaceFolder.uri, name);
+      const text = (await readWorkspaceTextFile(uri, remaining)).trim();
+      if (text) {
+        chunks.push(`## ${name}\n${text}`);
+        remaining -= text.length;
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return chunks.length ? `Project instructions (follow these):\n${chunks.join("\n\n")}` : "";
+}
+
+interface HookConfig {
+  preAction?: string;
+  postAction?: string;
+  onError?: string;
+}
+
+/**
+ * Run a configured hook command. Returns { ok, output }. A non-zero preAction
+ * exit blocks the pending plan (Claude Code hook semantics).
+ */
+async function runHook(name: keyof HookConfig, payload: Record<string, string>): Promise<{ ok: boolean; output: string } | undefined> {
+  const hooks = vscode.workspace.getConfiguration("clarusCode").get<HookConfig>("hooks", {});
+  const command = hooks[name]?.trim();
+  if (!command) {
+    return undefined;
+  }
+
+  const parts = command.match(/(?:[^\s"]+|"[^"]*")+/g)?.map((part) => part.replace(/^"|"$/g, "")) ?? [];
+  if (!parts.length) {
+    return undefined;
+  }
+
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  return new Promise((resolve) => {
+    const child = spawn(parts[0], parts.slice(1), {
+      cwd: workspaceFolder?.uri.fsPath,
+      windowsHide: true,
+      shell: process.platform === "win32",
+      env: {
+        ...process.env,
+        ...Object.fromEntries(Object.entries(payload).map(([key, value]) => [`CLARUS_${key.toUpperCase()}`, value.slice(0, 8000)]))
+      }
+    });
+    let output = "";
+    child.stdout?.on("data", (data: Buffer) => { output += data.toString("utf8"); });
+    child.stderr?.on("data", (data: Buffer) => { output += data.toString("utf8"); });
+    const timer = setTimeout(() => child.kill(), 30000);
+    child.on("error", (error) => { clearTimeout(timer); resolve({ ok: false, output: error.message }); });
+    child.on("close", (code) => { clearTimeout(timer); resolve({ ok: code === 0, output: output.trim().slice(0, 4000) }); });
+  });
+}
+
+interface SkillInfo {
+  name: string;
+  description: string;
+  path: string;
+}
+
+/** Discover skills: .nhax/skills/*.md — first non-empty line is the description. */
+async function loadSkills(): Promise<SkillInfo[]> {
+  const files = await vscode.workspace.findFiles(".nhax/skills/*.md", undefined, 50);
+  const skills: SkillInfo[] = [];
+  for (const file of files) {
+    try {
+      const text = await readWorkspaceTextFile(file, 2000);
+      const description = text.split(/\r?\n/).map((line) => line.replace(/^#+\s*/, "").trim()).find(Boolean) ?? "";
+      const relativePath = vscode.workspace.asRelativePath(file, false).replace(/\\/g, "/");
+      skills.push({ name: path.basename(file.fsPath, ".md"), description, path: relativePath });
+    } catch {
+      continue;
+    }
+  }
+  return skills.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Dynamic capability context appended to the system prompt: MCP tools + skills. */
+async function buildDynamicContext(): Promise<string> {
+  const sections: string[] = [];
+
+  const mcpTools = mcpManager?.allTools() ?? [];
+  if (mcpTools.length) {
+    sections.push([
+      "MCP tools (call via mcpTool operation):",
+      ...mcpTools.map((tool) => `- server=${tool.server} tool=${tool.name}: ${tool.description.slice(0, 200)}`)
+    ].join("\n"));
+  }
+
+  const skills = await loadSkills();
+  if (skills.length) {
+    sections.push([
+      "Skills (load the file with readFile when the task matches):",
+      ...skills.map((skill) => `- ${skill.name}: ${skill.description.slice(0, 160)} (${skill.path})`)
+    ].join("\n"));
+  }
+
+  return sections.join("\n\n");
+}
+
+/**
+ * Automatic context compaction: when the transcript exceeds the configured
+ * character budget, summarize everything but the newest turns into one note.
+ */
+async function autoCompactMessages(chatMessages: ChatMessage[], model: string, endpointMode: OpenAIEndpointMode): Promise<ChatMessage[]> {
+  const threshold = vscode.workspace.getConfiguration("clarusCode").get<number>("autoCompactThreshold", 120000);
+  if (!threshold) {
+    return chatMessages;
+  }
+
+  const total = chatMessages.reduce((sum, message) => sum + message.content.length, 0);
+  if (total <= threshold) {
+    return chatMessages;
+  }
+
+  const keepTail = 4;
+  const system = chatMessages[0];
+  const middle = chatMessages.slice(1, Math.max(1, chatMessages.length - keepTail));
+  const tail = chatMessages.slice(Math.max(1, chatMessages.length - keepTail));
+  if (!middle.length) {
+    return chatMessages;
+  }
+
+  const transcript = middle.map((message) => `${message.role}: ${message.content}`).join("\n\n").slice(0, 80000);
+  const summary = await callModel([
+    { role: "system", content: "Summarize this coding-session transcript into a compact context note preserving: goal, decisions, files touched, current state, open items. Korean. No preamble." },
+    { role: "user", content: transcript }
+  ], model, endpointMode, false);
+
+  return [
+    system,
+    { role: "user", content: `이전 대화 자동 요약 (컨텍스트 절약):\n${summary.content}` },
+    ...tail
+  ];
+}
+
+/**
+ * Subagent: nested read-only analysis loop with its own context.
+ * Mutating and mcpTool operations are ignored; read tools run for real.
+ */
+async function runSubagent(task: string, context: string | undefined, signal?: AbortSignal): Promise<string> {
+  const subMessages: ChatMessage[] = [
+    {
+      role: "system",
+      content: [
+        "You are a read-only research subagent inside NH-AX-CODE.",
+        "You may use ONLY readFile/listDir/searchText via clarus-actions blocks to inspect the workspace.",
+        "Never propose create/replace/delete/runCommand — they will be ignored.",
+        "When done, answer with your findings as plain text and NO clarus-actions block.",
+        SYSTEM_PROMPT
+      ].join("\n")
+    },
+    { role: "user", content: [task, context ? `\n추가 컨텍스트:\n${context}` : ""].join("") }
+  ];
+
+  let lastContent = "";
+  for (let step = 0; step < 4; step += 1) {
+    const result = await callModel(subMessages, undefined, undefined, false, undefined, signal);
+    lastContent = stripActionBlocks(result.content).trim() || lastContent;
+    const plan = parseFileActionPlan(result.content);
+    const readOps = plan?.operations.filter((operation): operation is Exclude<ReadOnlyOperation, { type: "subagent" }> =>
+      operation.type === "readFile" || operation.type === "listDir" || operation.type === "searchText") ?? [];
+    if (!readOps.length) {
+      break;
+    }
+
+    const results: string[] = [];
+    for (const operation of readOps.slice(0, 8)) {
+      try {
+        results.push(await runReadOnlyOperation(operation));
+      } catch (error) {
+        results.push(`${describeReadOnlyOperation(operation)} 실패: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    subMessages.push({ role: "assistant", content: result.content });
+    subMessages.push({ role: "user", content: `도구 결과:\n${results.join("\n\n").slice(0, 30000)}\n\n조사가 끝났으면 clarus-actions 없이 결론만 답하세요.` });
+  }
+
+  return lastContent || "서브에이전트가 결과를 내지 못했습니다.";
+}
+
+/** Run the configured verify command; returns its output or undefined when unset. */
+async function runVerifyCommand(requestId: string, post: (message: unknown) => void): Promise<string | undefined> {
+  const raw = vscode.workspace.getConfiguration("clarusCode").get<string>("verifyCommand", "").trim();
+  if (!raw) {
+    return undefined;
+  }
+
+  const parts = raw.match(/(?:[^\s"]+|"[^"]*")+/g)?.map((part) => part.replace(/^"|"$/g, "")) ?? [];
+  if (!parts.length) {
+    return undefined;
+  }
+
+  post({ type: "toolEvent", requestId, value: { label: `verify: ${raw}`, status: "running" } });
+  const result = await runApprovedCommand({ type: "runCommand", command: parts[0], args: parts.slice(1), cwd: "." });
+  post({ type: "toolEvent", requestId, value: { label: `verify: ${raw}`, status: /\nexit 0 /.test(`\n${result}`) ? "done" : "error" } });
+  return result;
+}
+
 async function createCheckpoint(plan: FileActionPlan): Promise<Checkpoint | undefined> {
   const targetPaths = uniqueStrings(plan.operations
-    .filter((operation): operation is Exclude<FileOperation, { type: "runCommand" }> => operation.type !== "runCommand")
+    .filter((operation): operation is Extract<FileOperation, { type: "create" | "replace" | "replaceRange" | "delete" }> =>
+      operation.type === "create" || operation.type === "replace" || operation.type === "replaceRange" || operation.type === "delete")
     .map((operation) => operation.path));
 
   if (!targetPaths.length) {
@@ -1723,6 +3020,7 @@ async function createCheckpoint(plan: FileActionPlan): Promise<Checkpoint | unde
   while (checkpoints.length > 20) {
     checkpoints.shift();
   }
+  await persistCheckpoints();
 
   return checkpoint;
 }
@@ -1730,15 +3028,14 @@ async function createCheckpoint(plan: FileActionPlan): Promise<Checkpoint | unde
 async function restoreLastCheckpoint(): Promise<void> {
   const checkpoint = checkpoints.at(-1);
   if (!checkpoint) {
+    void vscode.window.showInformationMessage("복원할 체크포인트가 없습니다.");
     return;
   }
 
-  const choice = "복원";
+  await restoreCheckpoint(checkpoint);
+}
 
-  if (choice !== "복원") {
-    return;
-  }
-
+async function restoreCheckpoint(checkpoint: Checkpoint): Promise<void> {
   const edit = new vscode.WorkspaceEdit();
   for (const file of checkpoint.files) {
     const uri = resolveWorkspaceUri(file.path);
@@ -1791,41 +3088,74 @@ function assertFileActionAllowed(relativePath: string, policy: FileActionPolicy)
   }
 }
 
-async function runApprovedCommand(operation: Extract<FileOperation, { type: "runCommand" }>): Promise<string> {
+async function runApprovedCommand(
+  operation: Extract<FileOperation, { type: "runCommand" }>,
+  onOutput?: (chunk: string) => void
+): Promise<string> {
   const commandLabel = formatCommandForDisplay(operation);
   const cwdUri = resolveCommandCwd(operation.cwd ?? ".");
+
+  // Integrated terminal mode: hand off to a visible terminal (no output capture).
+  if (vscode.workspace.getConfiguration("clarusCode").get<boolean>("runCommandsInTerminal", false)) {
+    const terminal = vscode.window.terminals.find((item) => item.name === "NH-AX-CODE")
+      ?? vscode.window.createTerminal({ name: "NH-AX-CODE", cwd: cwdUri.fsPath });
+    terminal.show(true);
+    terminal.sendText(commandLabel, true);
+    void recordCommandHistory({ command: commandLabel, cwd: cwdUri.fsPath, exit: "terminal", at: new Date().toISOString(), durationMs: 0 });
+    return `$ ${commandLabel}\n통합 터미널에서 실행했습니다 (출력은 터미널에서 확인).`;
+  }
+
   const started = Date.now();
-  try {
-    const result = await execFileAsync(operation.command, operation.args ?? [], {
+  const timeout = Math.min(Math.max(operation.timeoutMs ?? 120000, 1000), 600000);
+
+  return new Promise<string>((resolve) => {
+    const child = spawn(operation.command, operation.args ?? [], {
       cwd: cwdUri.fsPath,
-      timeout: Math.min(Math.max(operation.timeoutMs ?? 120000, 1000), 600000),
       windowsHide: true,
-      maxBuffer: 1024 * 1024 * 4
+      shell: process.platform === "win32"
     });
 
-    return [
-      `$ ${commandLabel}`,
-      `exit 0 in ${Date.now() - started}ms`,
-      formatCommandOutput("stdout", result.stdout),
-      formatCommandOutput("stderr", result.stderr)
-    ].filter(Boolean).join("\n");
-  } catch (error) {
-    const commandError = error as {
-      code?: number | string;
-      signal?: string;
-      stdout?: string | Buffer;
-      stderr?: string | Buffer;
-      message?: string;
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+
+    const timer = setTimeout(() => {
+      if (!settled) {
+        child.kill();
+      }
+    }, timeout);
+
+    child.stdout?.on("data", (data: Buffer) => {
+      const text = data.toString("utf8");
+      stdout += text;
+      onOutput?.(text);
+    });
+    child.stderr?.on("data", (data: Buffer) => {
+      const text = data.toString("utf8");
+      stderr += text;
+      onOutput?.(text);
+    });
+
+    const finish = (exit: string, extra?: string) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      const durationMs = Date.now() - started;
+      void recordCommandHistory({ command: commandLabel, cwd: cwdUri.fsPath, exit, at: new Date().toISOString(), durationMs });
+      resolve([
+        `$ ${commandLabel}`,
+        `exit ${exit} in ${durationMs}ms`,
+        extra ? `error:\n${extra}` : "",
+        formatCommandOutput("stdout", stdout),
+        formatCommandOutput("stderr", stderr)
+      ].filter(Boolean).join("\n"));
     };
 
-    return [
-      `$ ${commandLabel}`,
-      `exit ${commandError.code ?? commandError.signal ?? "error"} in ${Date.now() - started}ms`,
-      commandError.message ? `error:\n${commandError.message}` : "",
-      formatCommandOutput("stdout", commandError.stdout),
-      formatCommandOutput("stderr", commandError.stderr)
-    ].filter(Boolean).join("\n");
-  }
+    child.on("error", (error) => finish("error", error.message));
+    child.on("close", (code, signal) => finish(String(code ?? signal ?? "error")));
+  });
 }
 
 function resolveCommandCwd(relativePath: string): vscode.Uri {

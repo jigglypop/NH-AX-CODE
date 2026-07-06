@@ -1,6 +1,15 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { Streamdown, type PluginConfig } from "streamdown";
+import { code } from "@streamdown/code";
+import { cjk } from "@streamdown/cjk";
+import { mermaid } from "@streamdown/mermaid";
 import { getVsCodeApi } from "./vscode";
+import "streamdown/styles.css";
 import "./styles.css";
+
+// Streaming markdown pipeline: shiki code highlighting, CJK-aware incomplete-
+// markdown repair (Korean streaming), mermaid diagrams.
+const streamdownPlugins: PluginConfig = { code, cjk, mermaid };
 
 type ChatRole = "user" | "assistant";
 type PermissionMode = "workspace" | "plan-only";
@@ -38,9 +47,47 @@ interface HostMessage {
     | "modelListError"
     | "modelFallback"
     | "workspaceEntries"
-    | "workspaceEntriesError";
+    | "workspaceEntriesError"
+    | "loopMetrics"
+    | "toolEvent"
+    | "sessionData"
+    | "sessionCompacted"
+    | "skillList";
   requestId: string;
-  value?: string | string[] | WorkspaceEntry[] | ModelFallback | TokenUsage;
+  value?: string | string[] | WorkspaceEntry[] | ModelFallback | TokenUsage | LoopMetrics | ToolEvent | SessionData | null;
+}
+
+interface ToolEvent {
+  label: string;
+  status: string;
+  detail?: string;
+}
+
+interface SessionData {
+  messages: ChatMessage[];
+  model?: string;
+  permissionMode?: PermissionMode;
+  planMode?: boolean;
+}
+
+function isToolEvent(value: unknown): value is ToolEvent {
+  return typeof value === "object" && value !== null && "label" in value && "status" in value;
+}
+
+function isSessionData(value: unknown): value is SessionData {
+  return typeof value === "object" && value !== null && "messages" in value && Array.isArray((value as SessionData).messages);
+}
+
+interface LoopMetrics {
+  cBar: number;
+  rhoHat: number;
+  step: number;
+  converged: boolean;
+  reason: string;
+}
+
+function isLoopMetrics(value: unknown): value is LoopMetrics {
+  return typeof value === "object" && value !== null && "cBar" in value && "step" in value;
 }
 
 const defaultModels = ["gpt-5.5", "5.5", "gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "o3", "o4-mini"];
@@ -60,6 +107,9 @@ export function App() {
   const [planMode, setPlanMode] = useState(false);
   const [pendingRequestId, setPendingRequestId] = useState<string | null>(null);
   const [lastUsage, setLastUsage] = useState<TokenUsage | null>(null);
+  const [loopMetrics, setLoopMetrics] = useState<LoopMetrics | null>(null);
+  const [toolTimeline, setToolTimeline] = useState<ToolEvent[]>([]);
+  const [statusNote, setStatusNote] = useState("");
   const [mentionOptions, setMentionOptions] = useState<WorkspaceEntry[]>([]);
   const [mentionRange, setMentionRange] = useState<{ start: number; end: number } | null>(null);
   const [mentionRequestId, setMentionRequestId] = useState<string | null>(null);
@@ -100,9 +150,30 @@ export function App() {
       }
 
       if (message.type === "modelFallback" && message.requestId === pendingRequestId && isModelFallback(message.value)) {
-        setModelOptions((current) => uniqueModels(current.filter((item) => item !== message.value.failedModel).concat(message.value.usedModel)));
-        setModel(message.value.usedModel);
-        setModelStatus(`${message.value.usedModel} 사용 중`);
+        const fallback = message.value;
+        setModelOptions((current) => uniqueModels(current.filter((item) => item !== fallback.failedModel).concat(fallback.usedModel)));
+        setModel(fallback.usedModel);
+        setModelStatus(`${fallback.usedModel} 사용 중`);
+        return;
+      }
+
+      if (message.type === "sessionData") {
+        const session = isSessionData(message.value) ? message.value : null;
+        if (session && session.messages.length) {
+          setMessages(session.messages);
+          if (session.model) {
+            const restoredModel = session.model;
+            setModel(restoredModel);
+            setModelOptions((current) => uniqueModels([restoredModel, ...current]));
+          }
+          if (session.permissionMode) {
+            setPermissionMode(session.permissionMode);
+          }
+          if (typeof session.planMode === "boolean") {
+            setPlanMode(session.planMode);
+          }
+          setStatusNote("이전 세션을 복원했습니다");
+        }
         return;
       }
 
@@ -112,6 +183,47 @@ export function App() {
 
       if (message.type === "chatUsage" && isTokenUsage(message.value)) {
         setLastUsage(message.value);
+        return;
+      }
+
+      if (message.type === "loopMetrics" && isLoopMetrics(message.value)) {
+        setLoopMetrics(message.value);
+        return;
+      }
+
+      if (message.type === "toolEvent" && isToolEvent(message.value)) {
+        const event = message.value;
+        setToolTimeline((current) => {
+          // Collapse streaming "output" updates into the existing entry.
+          if (event.status === "output") {
+            return current;
+          }
+          const next = [...current.filter((item) => !(item.label === event.label && item.status === "running")), event];
+          return next.slice(-30);
+        });
+        return;
+      }
+
+      if (message.type === "skillList") {
+        const skills = Array.isArray(message.value) ? message.value as Array<{ name?: string; description?: string; path?: string }> : [];
+        const text = skills.length
+          ? `사용 가능한 스킬:\n${skills.map((skill) => `- ${skill.name}: ${skill.description} (${skill.path})`).join("\n")}`
+          : "스킬이 없습니다. .nhax/skills/*.md 파일을 추가하세요.";
+        setMessages((current) =>
+          current.map((item, index) =>
+            index === current.length - 1 && item.role === "assistant" ? { ...item, content: text } : item,
+          ),
+        );
+        setPendingRequestId(null);
+        return;
+      }
+
+      if (message.type === "sessionCompacted" && typeof message.value === "string") {
+        const compacted: ChatMessage[] = [{ role: "assistant", content: `이전 대화 요약:\n${message.value}` }];
+        setMessages(compacted);
+        setPendingRequestId(null);
+        setStatusNote("대화를 압축했습니다");
+        vscode.postMessage({ type: "saveSession", value: { messages: compacted } });
         return;
       }
 
@@ -127,6 +239,10 @@ export function App() {
 
       if (message.type === "chatDone") {
         setPendingRequestId(null);
+        setMessages((current) => {
+          vscode.postMessage({ type: "saveSession", value: { messages: current, model, permissionMode, planMode } });
+          return current;
+        });
       }
 
       if (message.type === "chatError") {
@@ -147,6 +263,7 @@ export function App() {
 
   useEffect(() => {
     refreshModels();
+    vscode.postMessage({ type: "loadSession", requestId: createRequestId() });
   }, []);
 
   useEffect(() => {
@@ -172,10 +289,100 @@ export function App() {
     setModelStatus("직접 추가됨");
   }
 
+  function cancelRequest() {
+    if (pendingRequestId) {
+      vscode.postMessage({ type: "chatCancel", requestId: pendingRequestId });
+      setStatusNote("취소 요청됨");
+    }
+  }
+
+  /** Slash commands: /clear /compact /model /plan /permissions. Returns true when handled. */
+  function handleSlashCommand(text: string): boolean {
+    if (!text.startsWith("/")) {
+      return false;
+    }
+
+    const [command, ...rest] = text.slice(1).split(/\s+/);
+    const argument = rest.join(" ").trim();
+
+    switch (command) {
+      case "clear":
+        setMessages([]);
+        setToolTimeline([]);
+        setLoopMetrics(null);
+        vscode.postMessage({ type: "saveSession", value: { messages: [] } });
+        setStatusNote("대화를 지웠습니다");
+        return true;
+      case "model":
+        if (argument) {
+          setModelOptions((current) => uniqueModels([argument, ...current]));
+          setModel(argument);
+          setStatusNote(`모델: ${argument}`);
+        } else {
+          setStatusNote(`현재 모델: ${model}`);
+        }
+        return true;
+      case "plan": {
+        const next = argument === "off" ? false : argument === "on" ? true : !planMode;
+        setPlanMode(next);
+        setStatusNote(`계획 모드 ${next ? "켜짐" : "꺼짐"}`);
+        return true;
+      }
+      case "permissions": {
+        if (argument === "workspace" || argument === "plan-only") {
+          setPermissionMode(argument);
+          setStatusNote(`권한 모드: ${argument}`);
+        } else {
+          setStatusNote(`권한 모드: ${permissionMode} (workspace | plan-only)`);
+        }
+        return true;
+      }
+      case "compact": {
+        if (!messages.length) {
+          setStatusNote("압축할 대화가 없습니다");
+          return true;
+        }
+        const requestId = createRequestId();
+        setPendingRequestId(requestId);
+        setStatusNote("대화 압축 중…");
+        vscode.postMessage({
+          type: "compactSession",
+          requestId,
+          messages,
+          settings: { permissionMode, planMode, model, endpointMode, streamResponses },
+        });
+        return true;
+      }
+      case "commit": {
+        const requestId = createRequestId();
+        setMessages((current) => [...current, { role: "user", content: "/commit" }, { role: "assistant", content: "" }]);
+        setPendingRequestId(requestId);
+        setStatusNote("AI 커밋 진행 중…");
+        vscode.postMessage({ type: "gitCommit", requestId });
+        return true;
+      }
+      case "skills": {
+        const requestId = createRequestId();
+        setPendingRequestId(requestId);
+        setMessages((current) => [...current, { role: "user", content: "/skills" }, { role: "assistant", content: "" }]);
+        vscode.postMessage({ type: "listSkills", requestId });
+        return true;
+      }
+      default:
+        setStatusNote(`알 수 없는 명령: /${command} (clear·compact·model·plan·permissions·commit·skills)`);
+        return true;
+    }
+  }
+
   function send(event?: FormEvent) {
     event?.preventDefault();
     const text = input.trim();
     if (!text || pendingRequestId) {
+      return;
+    }
+
+    if (handleSlashCommand(text)) {
+      setInput("");
       return;
     }
 
@@ -191,6 +398,9 @@ export function App() {
     setMentionRange(null);
     setMentionOptions([]);
     setLastUsage(null);
+    setLoopMetrics(null);
+    setToolTimeline([]);
+    setStatusNote("");
     setMessages(nextMessages);
     setPendingRequestId(requestId);
     vscode.postMessage({
@@ -250,7 +460,18 @@ export function App() {
           <span>{pendingRequestId ? "실행 중" : `${model} / ${endpointModeLabel(endpointMode)}`}</span>
           <span>{streamResponses ? "실시간" : "일괄"}</span>
           {lastUsage ? <span>{formatUsage(lastUsage)}</span> : null}
-          <button className="ghost-button" type="button" title="대화 지우기" onClick={() => setMessages([])}>
+          {loopMetrics ? (
+            <span title={loopMetrics.reason}>
+              {`루프 ${loopMetrics.step + 1} · c̄ ${loopMetrics.cBar.toFixed(2)} · ${loopMetrics.converged ? "수렴" : loopMetrics.rhoHat < 1 ? "수축" : "발산"}`}
+            </span>
+          ) : null}
+          {statusNote ? <span>{statusNote}</span> : null}
+          {pendingRequestId ? (
+            <button className="ghost-button" type="button" title="요청 중지" onClick={cancelRequest}>
+              중지
+            </button>
+          ) : null}
+          <button className="ghost-button" type="button" title="대화 지우기" onClick={() => handleSlashCommand("/clear")}>
             지우기
           </button>
         </div>
@@ -263,13 +484,49 @@ export function App() {
             <span>@로 파일이나 폴더 범위를 지정한 뒤 요청하세요.</span>
           </div>
         ) : (
-          messages.map((message, index) => (
-            <article className={`message ${message.role}`} key={`${message.role}-${index}`}>
-              <span>{message.role === "user" ? "나" : "NH-AX-CODE"}</span>
-              <p>{message.content}</p>
-            </article>
-          ))
+          messages.map((message, index) => {
+            const isLast = index === messages.length - 1;
+            const isStreamingNow = Boolean(pendingRequestId) && isLast && message.role === "assistant";
+            return (
+              <article className={`message ${message.role}`} key={`${message.role}-${index}`}>
+                <span>{message.role === "user" ? "나" : "NH-AX-CODE"}</span>
+                {message.role === "assistant" ? (
+                  message.content ? (
+                    <Streamdown
+                      className="markdown-body"
+                      mode={isStreamingNow ? "streaming" : "static"}
+                      isAnimating={isStreamingNow}
+                      caret={isStreamingNow ? "block" : undefined}
+                      plugins={streamdownPlugins}
+                      controls={{ code: true, table: true }}
+                    >
+                      {message.content}
+                    </Streamdown>
+                  ) : isStreamingNow ? (
+                    <div className="thinking" aria-label="생각 중">
+                      <span className="thinking-dot" />
+                      <span className="thinking-dot" />
+                      <span className="thinking-dot" />
+                      <em>생각 중…</em>
+                    </div>
+                  ) : null
+                ) : (
+                  <p>{message.content}</p>
+                )}
+              </article>
+            );
+          })
         )}
+        {toolTimeline.length ? (
+          <div className="tool-timeline">
+            {toolTimeline.map((event, index) => (
+              <div className={`tool-event ${event.status}`} key={`${event.label}-${index}`} title={event.detail ?? ""}>
+                <span>{event.status === "running" ? "…" : event.status === "done" ? "✓" : event.status === "blocked" ? "⛔" : "✗"}</span>
+                {event.label}
+              </div>
+            ))}
+          </div>
+        ) : null}
       </section>
 
       <form className="composer-wrap" onSubmit={send}>

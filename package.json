@@ -49,6 +49,30 @@
       {
         "command": "clarusCode.restoreLastCheckpoint",
         "title": "NH-AX-CODE: 최근 체크포인트 복원"
+      },
+      {
+        "command": "clarusCode.listCheckpoints",
+        "title": "NH-AX-CODE: 체크포인트 목록"
+      },
+      {
+        "command": "clarusCode.showCommandHistory",
+        "title": "NH-AX-CODE: 명령 실행 히스토리"
+      },
+      {
+        "command": "clarusCode.probeEndpoints",
+        "title": "NH-AX-CODE: 엔드포인트 진단"
+      },
+      {
+        "command": "clarusCode.editPermissionRules",
+        "title": "NH-AX-CODE: 권한 규칙 편집"
+      },
+      {
+        "command": "clarusCode.gitCommit",
+        "title": "NH-AX-CODE: AI 커밋 메시지로 커밋"
+      },
+      {
+        "command": "clarusCode.reloadMcpServers",
+        "title": "NH-AX-CODE: MCP 서버 재시작"
       }
     ],
     "menus": {
@@ -61,6 +85,24 @@
         },
         {
           "command": "clarusCode.restoreLastCheckpoint"
+        },
+        {
+          "command": "clarusCode.listCheckpoints"
+        },
+        {
+          "command": "clarusCode.showCommandHistory"
+        },
+        {
+          "command": "clarusCode.probeEndpoints"
+        },
+        {
+          "command": "clarusCode.editPermissionRules"
+        },
+        {
+          "command": "clarusCode.gitCommit"
+        },
+        {
+          "command": "clarusCode.reloadMcpServers"
         }
       ]
     },
@@ -117,6 +159,50 @@
           "type": "boolean",
           "default": true,
           "description": "생성된 파일 작업을 확인 없이 적용합니다."
+        },
+        "clarusCode.commandAllowlist": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "허용할 명령 접두사 목록입니다. 비어 있으면 모든 명령을 허용합니다(denylist 제외)."
+        },
+        "clarusCode.commandDenylist": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["rm -rf", "rmdir /s", "format", "del /f", "git push --force"],
+          "description": "차단할 명령 접두사 목록입니다. allowlist보다 우선합니다."
+        },
+        "clarusCode.runCommandsInTerminal": {
+          "type": "boolean",
+          "default": false,
+          "description": "명령을 출력 캡처 대신 통합 터미널에서 실행합니다."
+        },
+        "clarusCode.verifyCommand": {
+          "type": "string",
+          "default": "",
+          "description": "파일 수정 후 자동으로 실행할 검증 명령입니다 (예: npm test). 결과는 에이전트 자기비평에 들어갑니다."
+        },
+        "clarusCode.toolMode": {
+          "type": "string",
+          "enum": ["actions-block", "native"],
+          "default": "actions-block",
+          "description": "도구 호출 방식입니다. native는 provider의 function-calling을 사용합니다 (chat-completions/Anthropic 전용, 스트리밍 비활성)."
+        },
+        "clarusCode.autoCompactThreshold": {
+          "type": "number",
+          "default": 120000,
+          "minimum": 0,
+          "description": "대화 컨텍스트가 이 문자 수를 넘으면 오래된 메시지를 자동 요약합니다. 0이면 비활성."
+        },
+        "clarusCode.hooks": {
+          "type": "object",
+          "default": {},
+          "description": "훅 명령입니다. { \"preAction\": \"cmd\", \"postAction\": \"cmd\", \"onError\": \"cmd\" }. preAction이 0이 아닌 코드로 끝나면 작업이 차단됩니다."
+        },
+        "clarusCode.mcpServers": {
+          "type": "object",
+          "default": {},
+          "description": "MCP stdio 서버입니다. { \"이름\": { \"command\": \"npx\", \"args\": [\"-y\", \"@modelcontextprotocol/server-filesystem\", \".\"] } }"
         },
         "clarusCode.maxWorkspaceFiles": {
           "type": "number",

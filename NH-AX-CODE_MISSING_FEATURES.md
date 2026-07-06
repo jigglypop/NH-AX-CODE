@@ -32,10 +32,10 @@ Implemented:
 - Optional SSE parsing.
 - Endpoint mode UI.
 
-Still needed:
-- Per-model capability cache.
-- Failed endpoint blacklist per model.
-- Probe button and diagnostics view.
+Implemented (2026-07):
+- Per-model capability cache (globalState, working endpoint tried first).
+- Failed endpoint blacklist per model (structural mismatches only; never blacklists all).
+- `clarusCode.probeEndpoints` command: probes all three endpoints, reports to output channel, seeds the cache.
 
 ### 2. Terminal command execution
 
@@ -48,26 +48,34 @@ Implemented:
 - Approval modal before execution.
 - stdout/stderr captured and appended to chat.
 
-Still needed:
-- Streaming stdout/stderr events.
-- Command allow/deny rules.
-- Persistent command history.
-- Integrated terminal mode.
+Implemented (2026-07):
+- Streaming stdout/stderr via spawn → toolEvent messages.
+- `clarusCode.commandAllowlist` / `commandDenylist` prefix rules (deny wins).
+- Persistent command history (globalState, 100 entries, `clarusCode.showCommandHistory`).
+- Integrated terminal mode (`clarusCode.runCommandsInTerminal`).
 
 ### 3. Tool-based agent loop
 
-Status: first implementation done.
+Status: closed-loop controller implemented (2026-07, `src/agentLoop.ts`).
 
 Implemented:
-- Multi-step loop up to 4 model/action rounds.
+- Closed-loop controller per `docs/7_AGI/17_AgentLoop.md` (Layer F): self-critique
+  (F.4 c_pred/c_cons/c_nov) is injected into the next model turn (F.-1.3 closure),
+  contraction metric rhoHat halts non-contracting loops (same failing plan 3x),
+  dynamic step budget 4→8 stretches only while progressing (F.3 dual-process).
+- Apply errors no longer kill the turn — they become critique for self-correction.
+- Loop metrics (step, c̄, contraction/divergence) shown in the webview topbar.
 - Model output can apply `clarus-actions`, feed tool results back, then continue.
 - `runCommand` results can drive the next model step.
 
-Still needed:
-- Explicit tool schema separate from `clarus-actions`.
-- Read/search/list tools.
-- Tool call timeline in UI.
-- Stop/cancel support.
+Implemented (2026-07):
+- Read/search/list tools: `readFile`, `listDir`, `searchText` operations (read-only, plan-mode safe).
+- Tool call timeline in the webview (running/done/error/blocked per operation).
+- Stop/cancel: 중지 button → chatCancel → AbortSignal on in-flight fetch + loop exit.
+- Native function-calling (`clarusCode.toolMode: "native"`): OpenAI chat-completions
+  `tools`/`tool_calls` and Anthropic `tool_use`/`tool_result` with protocol-correct
+  feedback messages; falls back to `clarus-actions` blocks in `actions-block` mode.
+  Native mode disables streaming and per-op partial-accept (assumes auto-apply).
 
 ### 4. Diff review UI
 
@@ -78,10 +86,10 @@ Implemented:
 - File operations and command operations are shown before approval.
 - Accept/reject confirmation remains modal.
 
-Still needed:
-- True file-by-file diff preview.
-- Partial accept.
-- Applied vs proposed changes.
+Implemented (2026-07):
+- True file-by-file diff preview (vscode.diff with virtual documents, 현재 ↔ 제안).
+- Partial accept: per-operation multi-select QuickPick when `autoApplyFileActions` is off.
+- Applied vs proposed: rejected operations are reported back to the agent loop.
 
 ### 5. Checkpoint / rollback
 
@@ -92,28 +100,39 @@ Implemented:
 - Tracks existing files and newly created files.
 - Command palette command restores the latest checkpoint.
 
-Still needed:
-- Persistent checkpoints across VS Code reload.
-- Checkpoint list UI.
-- Diff before restore.
+Implemented (2026-07):
+- Persistent checkpoints across VS Code reload (workspaceState).
+- Checkpoint list UI (`clarusCode.listCheckpoints` QuickPick).
+- Diff before restore (현재 ↔ 체크포인트 per file).
 
 ## P1 Roadmap
 
-- `AGENTS.md`, `CLAUDE.md`, `NH-AX-CODE.md` instruction loading.
-- Real plan mode with read-only tool access.
-- Slash commands: `/clear`, `/compact`, `/model`, `/plan`, `/permissions`.
-- Session persistence and resume.
-- Test/build verification loop.
+All implemented (2026-07):
+- `NH-AX-CODE.md`, `AGENTS.md`, `CLAUDE.md` instruction loading into the system prompt (16k char budget).
+- Real plan mode: read-only tools (readFile/listDir/searchText) run, mutations blocked and reported.
+- Slash commands: `/clear`, `/compact` (model-summarized context), `/model`, `/plan`, `/permissions`.
+- Session persistence and resume (workspaceState; restored on webview mount, saved on each turn).
+- Test/build verification loop: `clarusCode.verifyCommand` runs after mutations, output feeds the F.4 critic.
 
 ## P2 Roadmap
 
-- Permission rule editor.
-- Hooks.
-- MCP connectors.
-- Skills and subagents.
-- Context compact.
-- Git workflow.
+All implemented (2026-07):
+- Permission rule editor: `clarusCode.editPermissionRules` QuickPick add/remove for allow/deny lists.
+- Hooks: `clarusCode.hooks` { preAction, postAction, onError } — preAction non-zero exit blocks the plan;
+  payload passed via CLARUS_* env vars.
+- MCP connectors: `clarusCode.mcpServers` stdio servers (src/mcp.ts, zero-dependency JSON-RPC client);
+  tools exposed as `mcpTool` operations and as `mcp__server__tool` native functions;
+  `clarusCode.reloadMcpServers` command.
+- Skills: `.nhax/skills/*.md` auto-listed in the system prompt (model loads via readFile); `/skills` command.
+- Subagents: `subagent {task, context?}` operation — nested read-only analysis loop with its own context.
+- Context compact: `/compact` (manual) + `clarusCode.autoCompactThreshold` automatic compaction before each turn.
+- Git workflow: `/commit` and `clarusCode.gitCommit` — AI-generated commit message, add -A, commit.
 
-## Next Recommended Step
+## Remaining Gaps (honest)
 
-Build the tool-based agent loop. The current implementation can apply model-generated actions, but a Codex-like agent needs iterative tool calls and visible timeline events.
+- Native tool-calling supports chat-completions and Anthropic only; `responses`/`completions`
+  endpoints stay on `clarus-actions` blocks.
+- MCP client implements initialize/tools only (no resources/prompts/notifications), stdio transport only.
+- Subagents are read-only by design; no parallel subagent execution.
+- Hooks run whole-plan (pre/post/error), not per-tool matchers.
+- Skills are prompt-listed pointers, not sandboxed executable bundles.

@@ -284,3 +284,119 @@ textarea::placeholder {
     align-self: flex-end;
   }
 }
+
+.tool-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  background: var(--vscode-sideBar-background);
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+}
+
+.tool-event {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tool-event span {
+  flex: none;
+  width: 12px;
+}
+
+.tool-event.done span {
+  color: var(--vscode-testing-iconPassed, #4caf50);
+}
+
+.tool-event.error span,
+.tool-event.blocked span {
+  color: var(--vscode-errorForeground);
+}
+
+.thinking {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 12px;
+}
+
+.thinking em {
+  margin-left: 4px;
+  font-style: normal;
+}
+
+.thinking-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--vscode-descriptionForeground);
+  animation: thinking-bounce 1.2s infinite ease-in-out;
+}
+
+.thinking-dot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.thinking-dot:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes thinking-bounce {
+  0%, 60%, 100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+  30% {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
+}
+
+.markdown-body {
+  font-size: 13px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.markdown-body pre {
+  overflow-x: auto;
+  border-radius: 6px;
+}
+
+.markdown-body code {
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 12px;
+}
+
+.markdown-body table {
+  border-collapse: collapse;
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.markdown-body th,
+.markdown-body td {
+  border: 1px solid var(--vscode-panel-border);
+  padding: 4px 8px;
+}
+
+.markdown-body a {
+  color: var(--vscode-textLink-foreground);
+}
+
+.markdown-body blockquote {
+  border-left: 3px solid var(--vscode-panel-border);
+  margin: 6px 0;
+  padding-left: 10px;
+  color: var(--vscode-descriptionForeground);
+}

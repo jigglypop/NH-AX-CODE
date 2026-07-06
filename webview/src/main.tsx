@@ -1,7 +1,10 @@
 import { Component, StrictMode, type ErrorInfo, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { installHostBridge } from "./hostBridge";
 import "./styles.css";
+
+installHostBridge();
 
 const root = document.getElementById("root");
 
